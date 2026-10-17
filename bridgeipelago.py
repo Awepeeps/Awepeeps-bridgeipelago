@@ -705,9 +705,9 @@ async def CheckArchHost():
                 #await MainChannel.send(message)
                 await DebugChannel.send(message)
                 # Local patch: tell players where the room moved.
-                RoomHost = CoreConfig["ArchipelagoConfig"][ArchipelagoServerURL].split("/")[2]
-                await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(RoomData["last_port"]) + "**")
                 SetConfigVariable("ArchipelagoPort", int(RoomData["last_port"]))
+                RoomHost = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")[2]
+                await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(RoomData["last_port"]) + "**")
         
         # We catch both TypeError and JSONDecodeError becuase they are what are thrown when the Arch server is unresponsive.
         # We don't REALLY mind these, as it's a byproduct of the server being offline and we're unable to fetch it properly.

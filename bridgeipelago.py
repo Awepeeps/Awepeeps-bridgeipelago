@@ -48,6 +48,7 @@ from bs4 import BeautifulSoup
 from discord.ext import tasks
 import discord
 from discord import app_commands
+from modules.player_commands import register_player_commands
 import time
 
 # Bridgeipelago Optional Modules
@@ -199,7 +200,7 @@ except Exception as e:
     print("!!! Error: " + str(e))
     OverClockValue = 1
 #TO DO - Central Control for bot I'll just leave this in for now.
-DiscordGuildID = 1171964435741544498
+PlayerCommandsSyncedGuild = None
 
 ## ARCHIPELAGO TRACKER CLIENT + CORE FUNCTION
 class TrackerClient():
@@ -538,15 +539,33 @@ async def on_ready():
     DebugChannel = discord_client.get_channel(int(CoreConfig["DiscordConfig"]["DiscordDebugChannel"]))
     await DebugChannel.send('Bot connected. Debug control - Online.')
 
-    # We wont sync the command tree for now, need to roll out central control first.
-    #await tree.sync(guild=discord.Object(id=DiscordGuildID))
+    global PlayerCommandsSyncedGuild
+    guild_id = MainChannel.guild.id
+    if PlayerCommandsSyncedGuild != guild_id:
+        guild = discord.Object(id=guild_id)
+        tree.copy_global_to(guild=guild)
+        try:
+            await tree.sync(guild=guild)
+        except discord.HTTPException as e:
+            print(
+                "Player command sync failed for configured guild:",
+                e.status,
+                type(e).__name__,
+            )
+        else:
+            PlayerCommandsSyncedGuild = guild_id
 
     #Start background tasks
-    CheckArchHost.start()
-    ProcessItemQueue.start()
-    ProcessDeathQueue.start()
-    ProcessChatQueue.start()
-    CheckCommandQueue.start()
+    if not CheckArchHost.is_running():
+        CheckArchHost.start()
+    if not ProcessItemQueue.is_running():
+        ProcessItemQueue.start()
+    if not ProcessDeathQueue.is_running():
+        ProcessDeathQueue.start()
+    if not ProcessChatQueue.is_running():
+        ProcessChatQueue.start()
+    if not CheckCommandQueue.is_running():
+        CheckCommandQueue.start()
 
     print("++ ",CoreConfig["AdvancedConfig"]["JoinMessage"])
     print("++ Async bot started -", discord_client.user)
@@ -611,7 +630,7 @@ async def on_message(message):
     if message.content.startswith('$hints'):
         await Command_Hints(message.author)
     
-    if message.content.startswith('$hint'):
+    if message.content.startswith('$hint '):
         hintrequest = [item.strip() for item in ((message.content).split('$hint '))[1].split('|')]
         if(len(hintrequest)==2):
             hint_queue.put(hintrequest)
@@ -957,64 +976,6 @@ async def ProcessChatQueue():
         print("ChatQueue - Error occurred while processing chat queue: " , str(e))
         await SendDebugChannelMessage("Error In Chat Queue Process")
 
-@tree.command(name="register",
-    description="Registers you for AP slot",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction,slot:str):
-    Status = await Command_Register(str(interaction.user),slot)    
-    await interaction.response.send_message(content=Status,ephemeral=True)
-
-@tree.command(name="clearreg",
-    description="Clears your registration file",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    Status = await Command_ClearReg(str(interaction.user))
-    await interaction.response.send_message(content=Status,ephemeral=True)
-    
-@tree.command(name="ketchmeup",
-    description="Ketches the user up with missed items",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction,filter:str):
-    await interaction.user.create_dm()
-    UserDM = interaction.user
-    await Command_KetchMeUp(UserDM, interaction.message.content)
-    await interaction.response.send_message(content="Sending your missed items... Please Hold.",ephemeral=True)
-
-@tree.command(name="groupcheck",
-    description="Ketches the user up with group game missed items",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction, groupslot:str):
-    await Command_GroupCheck(interaction.user, groupslot)
-    await interaction.response.send_message(content="Sending group missed items... Please Hold.",ephemeral=True)
-
-@tree.command(name="deathcount",
-    description="Posts a deathcount chart and graph",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    await Command_DeathCount()
-    await interaction.response.send_message(content="Deathcount")
-
-@tree.command(name="checkcount",
-    description="Posts a check chart",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    await Command_CheckCount()
-    await interaction.response.send_message(content="Checkcount:")
-
-@tree.command(name="checkgraph",
-    description="Posts a check graph",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    await Command_CheckGraph()
-    await interaction.response.send_message(content="Checkgraph:")
-
 async def SendMainChannelMessage(message):
     await MainChannel.send(message)
 
@@ -1173,7 +1134,7 @@ async def Command_GroupCheck(DMauthor, game):
     try:
         ItemQueueFile = GetCoreDirectory("item") + game + ".csv"
         if not os.path.isfile(ItemQueueFile):
-            await DMauthor.send("There are no items for " + game[1] + " :/")
+            await DMauthor.send("There are no items for " + game + " :/")
         else:
             k = open(ItemQueueFile, "r")
             ItemQueueLines = k.readlines()
@@ -1546,6 +1507,36 @@ async def Command_CheckGraph():
         WriteToErrorLog("Command_CheckGraph", "Error in check graph command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN CHECKGRAPH <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+
+PLAYER_COMMAND_NAMES = register_player_commands(
+    tree,
+    {
+        "help_text": """**Player slash commands**
+/help — show this list
+/register slot — register for a slot
+/listreg — DM your registrations
+/clearreg — remove your registrations
+/ketchmeup filter — DM missed items (0 all, 1 useful and progression, 2 progression)
+/groupcheck slot — DM queued items for a slot
+/hints — DM assigned hints
+/hint slot item — queue a hint request
+/checkcount — post check counts
+/checkgraph — post progress graph
+/deathcount — post DeathLink tally""",
+        "register": Command_Register,
+        "listreg": Command_ListRegistrations,
+        "clearreg": Command_ClearReg,
+        "ketchmeup": Command_KetchMeUp,
+        "groupcheck": Command_GroupCheck,
+        "hints": Command_Hints,
+        "hint_queue": lambda: hint_queue,
+        "checkcount": Command_CheckCount,
+        "checkgraph": Command_CheckGraph,
+        "deathcount": Command_DeathCount,
+    },
+    lambda: CoreConfig["DiscordConfig"]["DiscordBroadcastChannel"],
+)
+
 
 async def Command_ILoveYou(message):
     await message.channel.send("Thank you.  You make a difference in this world. :)")

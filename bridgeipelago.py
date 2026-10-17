@@ -551,6 +551,27 @@ async def on_ready():
     print("++ ",CoreConfig["AdvancedConfig"]["JoinMessage"])
     print("++ Async bot started -", discord_client.user)
 
+HelpText = """**Archipelago bot commands** (only work in this channel, lowercase)
+
+**Get started**
+`$register <slot>` - link your Discord to your slot (use your exact slot name)
+`$listreg` - DM you the slots you're registered for
+`$clearreg` - remove all your registrations
+
+**Catch up** (results come by DM)
+`$ketchmeup` - items other players sent you that you missed
+  `$ketchmeup 2` progression only, `1` + useful, `0` everything
+`$groupcheck <slot>` - all queued items for a slot
+`$hints` - hinted items for your registered slots
+
+**Hints & progress**
+`$hint <slot> | <item>` - request a hint, posted here
+`$checkcount` - check counts for everyone
+`$checkgraph` - progress graph
+`$deathcount` - DeathLink tally
+
+If the room moves to a new port, the bot posts the new address here."""
+
 @discord_client.event
 async def on_message(message):
     if message.author == discord_client.user:
@@ -606,6 +627,10 @@ async def on_message(message):
     if message.content.startswith('$checkgraph'):
         await Command_CheckGraph()
     
+    # Local patch: list the player commands.
+    if message.content.startswith('$help'):
+        await SendMainChannelMessage(HelpText)
+
     if message.content.startswith('$iloveyou'):
         await Command_ILoveYou(message)
 

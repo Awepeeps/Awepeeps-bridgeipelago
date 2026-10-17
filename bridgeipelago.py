@@ -679,6 +679,9 @@ async def CheckArchHost():
                 message = "Port Check Failed.  New port is " + str(RoomData["last_port"]) + "."
                 #await MainChannel.send(message)
                 await DebugChannel.send(message)
+                # Local patch: tell players where the room moved.
+                RoomHost = CoreConfig["ArchipelagoConfig"][ArchipelagoServerURL].split("/")[2]
+                await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(RoomData["last_port"]) + "**")
                 SetConfigVariable("ArchipelagoPort", int(RoomData["last_port"]))
         
         # We catch both TypeError and JSONDecodeError becuase they are what are thrown when the Arch server is unresponsive.

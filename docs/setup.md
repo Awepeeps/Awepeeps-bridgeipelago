@@ -65,9 +65,9 @@ You're done with the bot portal for now, but keep that token handy!
   1. Copy `config.json.template` to `config.json`
 - Discord Config
     1. Fill out the `DiscordToken` with your discord app/bot's token
-  1. Fill out `DiscordBroadcastChannel` with the channel ID that you'd like the bot to post AP info in
+  1. Fill out `DiscordBroadcastChannel` with the channel ID where the bot posts AP info and accepts player commands
     1. Fill out `DiscordAlertUserID` with your User ID. (This can also be a group/role in discord)
-    1. Fill out `DiscordDebugChannel` with the channel ID of the debug channel
+    1. Fill out `DiscordDebugChannel` with the channel ID for admin/debug alerts. Use the same ID as `DiscordBroadcastChannel` to keep commands and all channel notifications together, or choose a separate debug channel. The bot needs permission to view and send messages in each configured channel, and attach files in the broadcast channel for charts.
 - Archipelago Config
   1. Fill out `ArchipelagoServer` if you're self-hosting the Archipelago Server
   1. Fill out `ArchipelagoPort` with the port number you've been assigned

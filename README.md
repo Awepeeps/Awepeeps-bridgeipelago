@@ -117,9 +117,9 @@ Hopefully that makes sense.
 |---|---|
 |**Discord Config**||
 |`DiscordToken`|Your Discord Bot's token|
-|`DiscordBroadcastChannel`|Discord Channel ID for live-check purposes|
+|`DiscordBroadcastChannel`|Discord channel ID for AP notifications and player commands|
 |`DiscordAlertUserID`|Discord User/Group ID for yelling about issues [1]|
-|`DiscordDebugChannel`|Discord channel ID for debug purposes|
+|`DiscordDebugChannel`|Discord channel ID for admin/debug alerts; may match `DiscordBroadcastChannel` to keep bot activity in one channel|
 |`AnnounceConnection`|Send a debug-channel startup announcement (default: `false`)|
 |||
 |**Archipelago Config**||

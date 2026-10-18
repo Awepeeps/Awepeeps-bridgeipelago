@@ -3,7 +3,8 @@
         "DiscordToken": "",
         "DiscordBroadcastChannel": "",
         "DiscordAlertUserID": "",
-        "DiscordDebugChannel": ""
+        "DiscordDebugChannel": "",
+        "AnnounceConnection": false
     },
     "ArchipelagoConfig": {
         "ArchipelagoServer": "wss://archipelago.gg",

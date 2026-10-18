@@ -537,7 +537,8 @@ async def on_ready():
     #await MainChannel.send('Bot connected. Battle control - Online.')
     global DebugChannel
     DebugChannel = discord_client.get_channel(int(CoreConfig["DiscordConfig"]["DiscordDebugChannel"]))
-    await DebugChannel.send('Bot connected. Debug control - Online.')
+    if CoreConfig["DiscordConfig"].get("AnnounceConnection", False):
+        await DebugChannel.send('Bot connected. Debug control - Online.')
 
     global PlayerCommandsSyncedGuild
     guild_id = MainChannel.guild.id

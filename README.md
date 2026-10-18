@@ -120,6 +120,7 @@ Hopefully that makes sense.
 |`DiscordBroadcastChannel`|Discord Channel ID for live-check purposes|
 |`DiscordAlertUserID`|Discord User/Group ID for yelling about issues [1]|
 |`DiscordDebugChannel`|Discord channel ID for debug purposes|
+|`AnnounceConnection`|Send a debug-channel startup announcement (default: `false`)|
 |||
 |**Archipelago Config**||
 |`ArchipelagoServer`|The URL of the Archipelago server you'd like to connect to|

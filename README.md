@@ -41,6 +41,8 @@ When someone with deathlink dies, it'll shame them in this channel.
 > Cause: He was a dummy
 ```
 
+When an archipelago.gg room goes to sleep after a long stretch without new checks, the bot posts a notice with the room link. Opening that link wakes the room, and the bot posts again once it reconnects. The bot does not keep the room awake.
+
 What this bot will NOT do:
  - DM / ping you without consent
  - Find items for you

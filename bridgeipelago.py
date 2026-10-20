@@ -168,6 +168,7 @@ def SetupLogger():
 ReconnectionTimer = 5
 discord_client = None
 tracker_client = None
+RoomAsleep = False
 
 ## These are the main queues for processing data from the Archipelago Tracker to the Discord Bot
 ### Main Processing Queues
@@ -183,6 +184,24 @@ lottery_queue = Queue()
 discordbridge_queue = Queue()
 hint_queue = Queue()
 hintprocessing_queue = Queue()
+
+def QueueRoomSleepNotice(close_frame):
+    global RoomAsleep, CoreConfig
+    if close_frame is None or getattr(close_frame, "code", None) != 1001:
+        return
+    if not RoomAsleep:
+        RoomURL = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"]
+        chat_queue.put({"type": "CORE", "data": {"text": "\U0001f4a4 The Archipelago room has gone to sleep (no new checks for a while). Open " + str(RoomURL) + " to wake it up."}, "flag": "None"})
+    RoomAsleep = True
+
+def QueueRoomWakeNotice():
+    global RoomAsleep, CoreConfig
+    if not RoomAsleep:
+        return
+    RoomHost = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"].split("/")[2]
+    RoomPort = CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]
+    chat_queue.put({"type": "CORE", "data": {"text": "\u2600\ufe0f The Archipelago room is awake again at **" + str(RoomHost) + ":" + str(RoomPort) + "**."}, "flag": "None"})
+    RoomAsleep = False
 
 #Discord Bot Initialization
 intents = discord.Intents.default()
@@ -264,6 +283,7 @@ class TrackerClient():
                         elif cmd == self.MessageCommand.DATA_PACKAGE.value:
                             WriteDataPackage(args)
                         elif cmd == self.MessageCommand.CONNECTED.value:
+                            QueueRoomWakeNotice()
                             WriteArchConnectionJSON(args)
                             print("-- Tracker connected to server.")
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
@@ -302,10 +322,12 @@ class TrackerClient():
                         pass
                 except websockets.exceptions.ConnectionClosedError as e:
                     WriteToErrorLog("Websocket", "Tracker ConnectionClosedError: " + str(e))
+                    QueueRoomSleepNotice(getattr(e, "rcvd", None))
                     websocket_queue.put("!! Tracker ConnectionClosedError ...")
                     break
                 except websockets.exceptions.ConnectionClosed as e:
                     WriteToErrorLog("Websocket", "Tracker ConnectionClosed: " + str(e))
+                    QueueRoomSleepNotice(getattr(e, "rcvd", None))
                     websocket_queue.put("!! Tracker ConnectionClosed ...")
                     break
                 except websockets.exceptions.InvalidState as e:
@@ -399,6 +421,9 @@ class TrackerClient():
         except Exception as e:
             print("Error while trying to connect to Archipelago MultiServer:")
             print(e)
+            if isinstance(e, ConnectionRefusedError) or getattr(e, "errno", None) == 111 or getattr(e, "winerror", None) == 10061:
+                global RoomAsleep
+                RoomAsleep = True
             websocket_queue.put("!! Tracker start error...")
 
 ## ARCHIPELAGO HINT CLIENT + CORE FUNCTION

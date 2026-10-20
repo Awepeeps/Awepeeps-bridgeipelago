@@ -236,6 +236,9 @@ class TrackerClient():
     def run(self):
         #=== Main Run Loop ===
         global CoreConfig
+        LastReceivedTime = time.monotonic()
+        OutstandingPing = None
+        PingSentTime = None
         try:
             """Handles incoming messages from the Archipelago MultiServer."""
             
@@ -243,6 +246,9 @@ class TrackerClient():
                 #=== Message Loop ===#
                 try:
                     RawMessage = self.ap_connection.recv(timeout=float(CoreConfig["AdvancedConfig"]["QueueOverclock"]))
+                    LastReceivedTime = time.monotonic()
+                    OutstandingPing = None
+                    PingSentTime = None
                     for i in range(len(json.loads(RawMessage))):
                         args: dict = json.loads(RawMessage)[i]
                         cmd = args.get('cmd')
@@ -312,6 +318,19 @@ class TrackerClient():
                     WriteToErrorLog("Websocket", "Tracker Unspecified Exception: " + str(e))
                     websocket_queue.put("!! Tracker Unspecified Exception !?!?!?!? ...")
                     break
+                CurrentTime = time.monotonic()
+                if OutstandingPing is not None:
+                    if OutstandingPing.is_set():
+                        LastReceivedTime = CurrentTime
+                        OutstandingPing = None
+                        PingSentTime = None
+                    elif CurrentTime - PingSentTime >= 20:
+                        WriteToErrorLog("Websocket", "Tracker keepalive ping timed out after 20 seconds.")
+                        websocket_queue.put("!! Tracker keepalive timeout ...")
+                        break
+                elif CurrentTime - LastReceivedTime >= 60:
+                    OutstandingPing = self.ap_connection.ping()
+                    PingSentTime = CurrentTime
                 #=== End Message Loop ===#
 
                 if not discordbridge_queue.empty():

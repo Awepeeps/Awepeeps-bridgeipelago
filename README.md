@@ -120,7 +120,7 @@ Hopefully that makes sense.
 |**Discord Config**||
 |`DiscordToken`|Your Discord Bot's token|
 |`DiscordBroadcastChannel`|Discord channel ID for AP notifications and player commands|
-|`DiscordAlertUserID`|Discord User/Group ID for yelling about issues [1]|
+|`DiscordAlertUserID`|Optional Discord User/Group ID to mention in error alerts [1]; CheckArchHost alerts after 5 consecutive failed checks|
 |`DiscordDebugChannel`|Discord channel ID for admin/debug alerts; may match `DiscordBroadcastChannel` to keep bot activity in one channel|
 |`AnnounceConnection`|Send a debug-channel startup announcement (default: `false`)|
 |||

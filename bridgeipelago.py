@@ -746,6 +746,31 @@ async def CheckCommandQueue():
         print("++ Closing Discord Client")
         exit()
 
+# Alert only after a sustained Archipelago status check outage.
+CheckArchHostFailureCount = 0
+CheckArchHostAlertSent = False
+
+def AlertMention():
+    AlertUserID = str(CoreConfig["DiscordConfig"].get("DiscordAlertUserID", "")).strip()
+    return " <@" + AlertUserID + ">" if AlertUserID else ""
+
+async def RecordCheckArchHostFailure(Error):
+    global CheckArchHostFailureCount, CheckArchHostAlertSent
+    CheckArchHostFailureCount += 1
+    if CheckArchHostFailureCount >= 5 and not CheckArchHostAlertSent:
+        LastError = str(Error).replace("\n", " ")[:200]
+        await DebugChannel.send("ERROR IN CHECKARCHHOST: couldn't reach archipelago.gg for " + str(CheckArchHostFailureCount) + " checks in a row. Last error: " + LastError + AlertMention())
+        CheckArchHostAlertSent = True
+
+async def ResetCheckArchHostFailures():
+    global CheckArchHostFailureCount, CheckArchHostAlertSent
+    if CheckArchHostAlertSent:
+        await DebugChannel.send("CheckArchHost recovered after " + str(CheckArchHostFailureCount) + " failed checks.")
+    CheckArchHostFailureCount = 0
+    CheckArchHostAlertSent = False
+
+
+
 @tasks.loop(seconds=60)
 async def CheckArchHost():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -755,8 +780,9 @@ async def CheckArchHost():
             ArchRoomID = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")
             ArchAPIUEL = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/room/")
             RoomAPI = ArchAPIUEL[0]+"/api/room_status/"+ArchRoomID[4]
-            RoomPage = requests.get(RoomAPI)
+            RoomPage = requests.get(RoomAPI, timeout=10)
             RoomData = json.loads(RoomPage.content)
+            await ResetCheckArchHostFailures()
 
             cond = str(RoomData["last_port"])
             if(int(cond) == CoreConfig["ArchipelagoConfig"]['ArchipelagoPort']):
@@ -778,11 +804,13 @@ async def CheckArchHost():
         # The bot will only scream when there is an unhandled error that we have to look into, as is the case with the other processes.
         except TypeError as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: [TypeError] " + str(e))
+            await RecordCheckArchHostFailure(e)
         except json.JSONDecodeError as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: [JSONDecodingError] " + str(e))
+            await RecordCheckArchHostFailure(e)
         except Exception as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: " + str(e))
-            await DebugChannel.send("ERROR IN CHECKARCHHOST <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+            await RecordCheckArchHostFailure(e)
 
 @tasks.loop(seconds=float(OverClockValue))
 async def ProcessItemQueue():
@@ -1055,7 +1083,7 @@ async def Command_Register(Sender:str, ArchSlot:str):
     except Exception as e:
         WriteToErrorLog("Command_Register", "Error in register command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN REGISTER <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN REGISTER"+AlertMention())
         return "Critical error in REGISTER :("
 
 async def Command_ListRegistrations(Sender):
@@ -1082,7 +1110,7 @@ async def Command_ListRegistrations(Sender):
     except Exception as e:
         WriteToErrorLog("Command_ListRegistrations", "Error in list registrations command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN LISTREG <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN LISTREG"+AlertMention())
 
 async def Command_ClearReg(Sender:str):
     try:
@@ -1094,7 +1122,7 @@ async def Command_ClearReg(Sender:str):
     except Exception as e:
         WriteToErrorLog("Command_ClearReg", "Error in clear registration command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN CLEARREG <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN CLEARREG"+AlertMention())
 
 async def Command_KetchMeUp(User, message_filter):
     try:
@@ -1173,7 +1201,7 @@ async def Command_KetchMeUp(User, message_filter):
     except Exception as e:
         WriteToErrorLog("Command_KetchMeUp", "Error in ketch me up command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN KETCHMEUP <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN KETCHMEUP"+AlertMention())
 
 async def Command_GroupCheck(DMauthor, game):
     try:
@@ -1201,7 +1229,7 @@ async def Command_GroupCheck(DMauthor, game):
     except Exception as e:
         WriteToErrorLog("Command_GroupCheck", "Error in group check command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN GROUPCHECK <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN GROUPCHECK"+AlertMention())
 
 async def Command_Hints(player):
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1317,7 +1345,7 @@ async def Command_Hints(player):
     except Exception as e:
         WriteToErrorLog("Command_Hints", "Error in hints command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN HINTLIST <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN HINTLIST"+AlertMention())
 
 async def Command_DeathCount():
     try:
@@ -1395,7 +1423,7 @@ async def Command_DeathCount():
         await MainChannel.send(file=discord.File(GetCoreFiles("deathplot")))
     except Exception as e:
         WriteToErrorLog("Command_DeathCount", "Error in death count command: " + str(e))
-        await DebugChannel.send("ERROR DEATHCOUNT <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR DEATHCOUNT"+AlertMention())
 
 async def Command_CheckCount():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1470,7 +1498,7 @@ async def Command_CheckCount():
     except Exception as e:
         WriteToErrorLog("Command_CheckCount", "Error in check count command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN CHECKCOUNT <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN CHECKCOUNT"+AlertMention())
 
 async def Command_CheckGraph():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1551,7 +1579,7 @@ async def Command_CheckGraph():
     except Exception as e:
         WriteToErrorLog("Command_CheckGraph", "Error in check graph command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN CHECKGRAPH <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN CHECKGRAPH"+AlertMention())
 
 PLAYER_COMMAND_NAMES = register_player_commands(
     tree,

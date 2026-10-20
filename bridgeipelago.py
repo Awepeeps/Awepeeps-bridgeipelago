@@ -190,8 +190,9 @@ def QueueRoomSleepNotice(close_frame):
     if close_frame is None or getattr(close_frame, "code", None) != 1001:
         return
     if not RoomAsleep:
+        # Angle brackets stop Discord fetching a link preview, which would wake the room.
         RoomURL = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"]
-        chat_queue.put({"type": "CORE", "data": {"text": "\U0001f4a4 The Archipelago room has gone to sleep (no new checks for a while). Open " + str(RoomURL) + " to wake it up."}, "flag": "None"})
+        chat_queue.put({"type": "CORE", "data": {"text": "\U0001f4a4 The Archipelago room has gone to sleep (no new checks for a while). Open <" + str(RoomURL) + "> to wake it up."}, "flag": "None"})
     RoomAsleep = True
 
 def QueueRoomWakeNotice():

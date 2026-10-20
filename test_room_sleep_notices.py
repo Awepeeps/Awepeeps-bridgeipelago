@@ -86,7 +86,7 @@ class RoomSleepNoticeTests(unittest.TestCase):
         self.assertEqual(len(namespace["chat_queue"].messages), 1)
         message = namespace["chat_queue"].messages[0]
         self.assertEqual(message["type"], "CORE")
-        self.assertIn("https://archipelago.gg/room/abc", message["data"]["text"])
+        self.assertIn("<https://archipelago.gg/room/abc>", message["data"]["text"])
 
     def test_non_1001_close_does_not_queue_notice(self):
         namespace = self.run_disconnect(1000)

@@ -49,6 +49,11 @@
     "DrawbridgeConfig": {
         "DiscordBridgeEnabled": false
     },
+    "DailyPostConfig": {
+        "Enabled": false,
+        "Time": "00:00",
+        "Timezone": "America/New_York"
+    },
     "MetaConfig": {
         "FlavorDeathlink": false,
         "DeathlinkLottery": false

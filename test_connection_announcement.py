@@ -43,6 +43,7 @@ class ConnectionAnnouncementTests(unittest.TestCase):
             "PlayerCommandsSyncedGuild": None, "tree": tree,
             "CheckArchHost": tasks[0], "ProcessItemQueue": tasks[1], "ProcessDeathQueue": tasks[2],
             "ProcessChatQueue": tasks[3], "CheckCommandQueue": tasks[4],
+            "StartDailyPostScheduler": AsyncMock(),
         })
         with unittest.mock.patch("builtins.print"):
             asyncio.run(on_ready())

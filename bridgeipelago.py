@@ -18,6 +18,7 @@
 
 
 #Core Dependencies
+import asyncio
 import json
 import typing
 import uuid
@@ -49,6 +50,12 @@ from discord.ext import tasks
 import discord
 from discord import app_commands
 from modules.player_commands import register_player_commands
+from modules.daily_post import (
+    DailyPostConfigError,
+    DailyPostState,
+    load_daily_post_settings,
+    run_daily_posts,
+)
 import time
 
 # Bridgeipelago Optional Modules
@@ -169,6 +176,7 @@ ReconnectionTimer = 5
 discord_client = None
 tracker_client = None
 RoomAsleep = False
+DailyPostTask = None
 
 ## These are the main queues for processing data from the Archipelago Tracker to the Discord Bot
 ### Main Processing Queues
@@ -575,6 +583,75 @@ class HintClient:
 
 
 ## DISCORD EVENT HANDLERS + CORE FUNTION
+async def PostDailyStats():
+    failures = []
+    reports = (
+        ("death count", Command_DeathCount),
+        ("check graph", Command_CheckGraph),
+    )
+    # Try both reports even if the first one fails, so a broken report does not
+    # hide the other one. The scheduler logs the raised error and tries again
+    # at the next day's scheduled time rather than retrying later today.
+    for name, report in reports:
+        try:
+            delivered = await report()
+        except Exception as error:
+            failures.append("%s raised %s: %s" % (
+                name, type(error).__name__, error
+            ))
+            continue
+        if delivered is False:
+            failures.append(name + " did not deliver")
+
+    if failures:
+        raise RuntimeError("; ".join(failures) + ".")
+
+def ReportDailyPostError(error):
+    message = "Daily post failed: " + str(error)
+    print("!!! " + message)
+    try:
+        WriteToErrorLog("DailyPost", message)
+    except Exception:
+        pass
+
+async def StartDailyPostScheduler():
+    global DailyPostTask
+    try:
+        settings = load_daily_post_settings(CoreConfig.get("DailyPostConfig"))
+    except DailyPostConfigError as error:
+        message = "Daily post configuration error: " + str(error)
+        print("!!! " + message)
+        try:
+            WriteToErrorLog("DailyPost", message)
+        except Exception:
+            pass
+        try:
+            await DebugChannel.send(message)
+        except Exception:
+            pass
+        return
+
+    if settings is None:
+        return
+    if DailyPostTask is not None and not DailyPostTask.done():
+        return
+
+    state = DailyPostState(
+        GetCoreDirectory("log") + "DailyPostState.json",
+        log=lambda message: print("!!! " + message),
+    )
+    DailyPostTask = discord_client.loop.create_task(
+        run_daily_posts(
+            settings,
+            state,
+            PostDailyStats,
+            on_error=ReportDailyPostError,
+        )
+    )
+    print("++ Daily post scheduled for %02d:%02d %s" % (
+        settings.hour, settings.minute, settings.timezone_name
+    ))
+
 @discord_client.event
 async def on_ready():
     global MainChannel
@@ -612,6 +689,7 @@ async def on_ready():
         ProcessChatQueue.start()
     if not CheckCommandQueue.is_running():
         CheckCommandQueue.start()
+    await StartDailyPostScheduler()
 
     print("++ ",CoreConfig["AdvancedConfig"]["JoinMessage"])
     print("++ Async bot started -", discord_client.user)
@@ -1349,6 +1427,7 @@ async def Command_Hints(player):
         await DebugChannel.send("ERROR IN HINTLIST"+AlertMention())
 
 async def Command_DeathCount():
+    fig = None
     try:
         d = open(GetCoreFiles("deathlog"),"r")
         DeathLines = d.readlines()
@@ -1357,7 +1436,7 @@ async def Command_DeathCount():
 
         if len(DeathLines) == 0:
             await MainChannel.send("No deaths to report.")
-            return
+            return True
         
         for deathline in DeathLines:
             DeathUser = deathline.split("||")[6]
@@ -1422,9 +1501,14 @@ async def Command_DeathCount():
         # Save image and send - any existing plot will be overwritten
         plt.savefig(GetCoreFiles("deathplot"), bbox_inches="tight")
         await MainChannel.send(file=discord.File(GetCoreFiles("deathplot")))
+        return True
     except Exception as e:
         WriteToErrorLog("Command_DeathCount", "Error in death count command: " + str(e))
         await DebugChannel.send("ERROR DEATHCOUNT"+AlertMention())
+        return False
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 async def Command_CheckCount():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1506,9 +1590,15 @@ async def Command_CheckGraph():
         await MainChannel.send("This command is not available in self-hosted mode.")
         return
 
+    fig = None
     try:
-        page = requests.get(CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'])
-        soup = BeautifulSoup(page.content, "html.parser")
+        response = await asyncio.to_thread(
+            requests.get,
+            CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'],
+            timeout=15,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
 
         #Yoinks table rows from the checks table
         tables = soup.find("table",id="checks-table")
@@ -1577,10 +1667,15 @@ async def Command_CheckGraph():
         # Save image and send - any existing plot will be overwritten
         plt.savefig(GetCoreFiles("checkplot"), bbox_inches="tight")
         await MainChannel.send(file=discord.File(GetCoreFiles("checkplot")))
+        return True
     except Exception as e:
         WriteToErrorLog("Command_CheckGraph", "Error in check graph command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN CHECKGRAPH"+AlertMention())
+        return False
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 PLAYER_COMMAND_NAMES = register_player_commands(
     tree,

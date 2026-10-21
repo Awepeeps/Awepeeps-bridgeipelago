@@ -171,6 +171,15 @@ Hopefully that makes sense.
 |**Drawbridge Config**||
 |`DiscordBridgeEnabled`|Will toggle the ability to send messages to AP from Discord|
 |||
+|**Daily Post Config**||
+|`Enabled`|Post `$deathcount` and `$checkgraph` results to the broadcast channel once per local day (default: `false`)|
+|`Time`|Local 24-hour `HH:MM` time for the daily post (default: `00:00`)|
+|`Timezone`|IANA timezone for `Time` and the once-per-day date, e.g. `America/New_York` (default: `America/New_York`)|
+||Daylight saving changes are handled automatically. The bot waits for the next configured time after startup and does not catch up on a post missed while the bot was stopped. If the process is suspended across the scheduled time, it may still deliver that missed post late once after it resumes.|
+||The last posted local date is stored in `logs/<UniqueID>/DailyPostState.json`, so reconnects and restarts cannot post twice in one day.|
+||Each report is attempted once per day. A failed report is logged and not retried the same day; the bot tries again at the next day's scheduled time.|
+||`SelfHostNoWeb` mode disables the check graph, so daily posts require the tracker web page.|
+|||
 |**Meta Config**||
 |`FlavorDeathLink`|Will change deathlink messages to have a little more personality [4]|
 |`DeathLinkLottery`|Unused... for now >:) |

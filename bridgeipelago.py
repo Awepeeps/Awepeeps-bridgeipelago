@@ -212,7 +212,7 @@ def QueueRoomWakeNotice():
         return
     RoomHost = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"].split("/")[2]
     RoomPort = CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]
-    chat_queue.put({"type": "CORE", "data": {"text": "Archipelago connection restored at **" + str(RoomHost) + ":" + str(RoomPort) + "**."}, "flag": "None"})
+    chat_queue.put({"type": "CORE", "data": {"text": "\u2600\ufe0f The Archipelago room is reachable again at **" + str(RoomHost) + ":" + str(RoomPort) + "**."}, "flag": "None"})
     RoomAsleep = False
     ConnectionUnavailableSince = None
 
@@ -222,7 +222,7 @@ def QueueRoomUnavailableNotice():
         return
     if not RoomAsleep:
         RoomURL = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"]
-        chat_queue.put({"type": "CORE", "data": {"text": "The Archipelago connection is unavailable; the room may be asleep. Open <" + str(RoomURL) + "> to wake it up."}, "flag": "None"})
+        chat_queue.put({"type": "CORE", "data": {"text": "\U0001f4a4 The Archipelago room may be asleep (connection unavailable). Open <" + str(RoomURL) + "> to wake it up."}, "flag": "None"})
         RoomAsleep = True
 
 #Discord Bot Initialization

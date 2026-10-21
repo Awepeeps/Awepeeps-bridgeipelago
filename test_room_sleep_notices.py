@@ -100,7 +100,7 @@ class RoomSleepNoticeTests(unittest.TestCase):
         namespace["QueueRoomUnavailableNotice"]()
         self.assertEqual(len(namespace["chat_queue"].messages), 1)
         text = namespace["chat_queue"].messages[0]["data"]["text"]
-        self.assertIn("connection is unavailable", text)
+        self.assertTrue(text.startswith("\U0001f4a4 The Archipelago room"))
         self.assertIn("room may be asleep", text)
         self.assertIn("<https://archipelago.gg/room/abc>", text)
         client.is_closed.clear()
@@ -108,7 +108,7 @@ class RoomSleepNoticeTests(unittest.TestCase):
         client.run()
         self.assertFalse(namespace["RoomAsleep"])
         self.assertEqual(len(namespace["chat_queue"].messages), 2)
-        self.assertIn("connection restored", namespace["chat_queue"].messages[1]["data"]["text"])
+        self.assertIn("\u2600\ufe0f The Archipelago room is reachable again", namespace["chat_queue"].messages[1]["data"]["text"])
         self.assertNotIn("awake", namespace["chat_queue"].messages[1]["data"]["text"])
 
     def test_connected_without_sleep_flag_does_not_queue_notice(self):
@@ -136,7 +136,7 @@ class RoomSleepNoticeTests(unittest.TestCase):
         client.start()
         self.assertTrue(namespace["RoomAsleep"])
         self.assertEqual(len(namespace["chat_queue"].messages), 1)
-        self.assertIn("connection is unavailable", namespace["chat_queue"].messages[0]["data"]["text"])
+        self.assertIn("connection unavailable", namespace["chat_queue"].messages[0]["data"]["text"])
 
 
 if __name__ == "__main__":

@@ -176,6 +176,7 @@ ReconnectionTimer = 5
 discord_client = None
 tracker_client = None
 RoomAsleep = False
+ConnectionUnavailableSince = None
 DailyPostTask = None
 
 ## These are the main queues for processing data from the Archipelago Tracker to the Discord Bot
@@ -193,24 +194,36 @@ discordbridge_queue = Queue()
 hint_queue = Queue()
 hintprocessing_queue = Queue()
 
-def QueueRoomSleepNotice(close_frame):
-    global RoomAsleep, CoreConfig
+def QueueRoomSleepNotice(close_frame=None):
+    """Record a 1001 disconnect; it does not establish that the room is asleep."""
+    global ConnectionUnavailableSince
     if close_frame is None or getattr(close_frame, "code", None) != 1001:
         return
-    if not RoomAsleep:
-        # Angle brackets stop Discord fetching a link preview, which would wake the room.
-        RoomURL = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"]
-        chat_queue.put({"type": "CORE", "data": {"text": "\U0001f4a4 The Archipelago room has gone to sleep (no new checks for a while). Open <" + str(RoomURL) + "> to wake it up."}, "flag": "None"})
-    RoomAsleep = True
+    if ConnectionUnavailableSince is None:
+        ConnectionUnavailableSince = time.monotonic()
 
 def QueueRoomWakeNotice():
-    global RoomAsleep, CoreConfig
+    global RoomAsleep, ConnectionUnavailableSince, CoreConfig
+    if ConnectionUnavailableSince is None:
+        return
+    # Recovery before a notice was emitted is a transient reconnect, so stay quiet.
     if not RoomAsleep:
+        ConnectionUnavailableSince = None
         return
     RoomHost = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"].split("/")[2]
     RoomPort = CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]
-    chat_queue.put({"type": "CORE", "data": {"text": "\u2600\ufe0f The Archipelago room is awake again at **" + str(RoomHost) + ":" + str(RoomPort) + "**."}, "flag": "None"})
+    chat_queue.put({"type": "CORE", "data": {"text": "Archipelago connection restored at **" + str(RoomHost) + ":" + str(RoomPort) + "**."}, "flag": "None"})
     RoomAsleep = False
+    ConnectionUnavailableSince = None
+
+def QueueRoomUnavailableNotice():
+    global RoomAsleep, ConnectionUnavailableSince, CoreConfig
+    if ConnectionUnavailableSince is None or RoomAsleep or time.monotonic() - ConnectionUnavailableSince < 60:
+        return
+    if not RoomAsleep:
+        RoomURL = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"]
+        chat_queue.put({"type": "CORE", "data": {"text": "The Archipelago connection is unavailable; the room may be asleep. Open <" + str(RoomURL) + "> to wake it up."}, "flag": "None"})
+        RoomAsleep = True
 
 #Discord Bot Initialization
 intents = discord.Intents.default()
@@ -431,8 +444,9 @@ class TrackerClient():
             print("Error while trying to connect to Archipelago MultiServer:")
             print(e)
             if isinstance(e, ConnectionRefusedError) or getattr(e, "errno", None) == 111 or getattr(e, "winerror", None) == 10061:
-                global RoomAsleep
-                RoomAsleep = True
+                # Refusal is not evidence that the room is asleep. If a 1001
+                # candidate exists, retry attempts let the debounce mature.
+                QueueRoomUnavailableNotice()
             websocket_queue.put("!! Tracker start error...")
 
 ## ARCHIPELAGO HINT CLIENT + CORE FUNCTION
@@ -586,10 +600,11 @@ class HintClient:
 async def PostDailyStats():
     failures = []
     reports = (
-        ("death count", Command_DeathCount),
+        ("check count", Command_CheckCount),
         ("check graph", Command_CheckGraph),
+        ("death count", Command_DeathCount),
     )
-    # Try both reports even if the first one fails, so a broken report does not
+    # Try every report even if one fails, so a broken report does not
     # hide the other one. The scheduler logs the raised error and tries again
     # at the next day's scheduled time rather than retrying later today.
     for name, report in reports:
@@ -1516,7 +1531,12 @@ async def Command_CheckCount():
         return
 
     try:
-        page = requests.get(CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'])
+        page = await asyncio.to_thread(
+            requests.get,
+            CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'],
+            timeout=15,
+        )
+        page.raise_for_status()
         soup = BeautifulSoup(page.content, "html.parser")
 
         #Yoinks table rows from the checks table
@@ -1580,10 +1600,12 @@ async def Command_CheckCount():
         #Finishes the check message
         checkmessage = checkmessage + "```"
         await MainChannel.send(checkmessage)
+        return True
     except Exception as e:
         WriteToErrorLog("Command_CheckCount", "Error in check count command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN CHECKCOUNT"+AlertMention())
+        return False
 
 async def Command_CheckGraph():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:

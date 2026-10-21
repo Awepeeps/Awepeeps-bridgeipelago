@@ -78,7 +78,7 @@ You're done with the bot portal for now, but keep that token handy!
   1. Fill out `UniqueID` with the RoomID/seed/an arbitrary value (see [UniqueID](#UniqueID) for detailed usage)
 - Item Filter Config
   1. Set `BotItemSpoilTraps` to `true` if you'd like to have traps spoiled, or change to `false` to hide traps
-  1. Set `BotItemFilterLevel` to the level you'd like: `0`, `1`, or `2` (See the main [Readme](/README.md) for details on what the filter levels mean)
+  1. Set `BotItemFilterLevel` to the level you'd like: `0`, `1`, or `2` (see the main [Readme](/README.md) for details on what the filter levels mean). Level `2` means progression items only. This value is read from your local `config.json` (ignored by git), not hardcoded in the bot. The generic `config.json.template` keeps the default level `0`.
 - Relay Config
   1. Set desired AP to Discord relay options.
 - Drawbridge Config
@@ -86,11 +86,11 @@ You're done with the bot portal for now, but keep that token handy!
 - Meta Config
   1. Set `FlavorDeathLink` to `true` if you'd like custom flavored deathlink messages.
 - Daily Post Config (optional, disabled by default)
-  1. Set `Enabled` to `true` to post `$deathcount` and `$checkgraph` results to the broadcast channel once a day.
+  1. Set `Enabled` to `true` to post `$checkcount`, `$checkgraph`, and `$deathcount` results to the broadcast channel once a day, in that order.
   1. Set `Time` to the local 24-hour `HH:MM` time you want the post (default `00:00`).
   1. Set `Timezone` to an IANA timezone such as `America/New_York` (default `America/New_York`).
   1. The bot waits for the next configured time after startup rather than posting immediately, and it remembers the last posted local date in `logs/<UniqueID>/DailyPostState.json` so restarts do not repeat a day. If the process is suspended across the scheduled time, the missed post may still be delivered late once after it resumes.
-  1. Each report is attempted once per day. A failure is logged and not retried the same day; the bot tries again at the next day's scheduled time.
+  1. Each report is attempted once per day. A failed report does not prevent later reports from running. Failures are logged and not retried the same day; the bot tries again at the next day's scheduled time.
   1. `SelfHostNoWeb` mode disables the check graph, so daily posts need the tracker web page.
 
 You're free to leave the Advanced Config section as-is unless you know what you're doing.  

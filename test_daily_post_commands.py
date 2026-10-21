@@ -25,7 +25,7 @@ TRACKER_HTML = """
 
 def load_commands():
     tree = ast.parse((ROOT / "bridgeipelago.py").read_text(encoding="utf-8"))
-    names = {"Command_DeathCount", "Command_CheckGraph", "PostDailyStats"}
+    names = {"Command_DeathCount", "Command_CheckCount", "Command_CheckGraph", "PostDailyStats"}
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
     namespace = {}
     exec(
@@ -229,17 +229,62 @@ class DailyPostCommandTests(unittest.TestCase):
             "This command is not available in self-hosted mode."
         )
 
-    def test_post_daily_stats_succeeds_when_both_reports_deliver(self):
-        asyncio.run(self.ns["PostDailyStats"]())
-        self.assertEqual(len(self.requests.calls), 1)
+    def test_check_count_returns_true_and_bounds_the_http_request(self):
+        self.requests.delay = 0.05
+        main_thread = threading.get_ident()
+        result = asyncio.run(self.ns["Command_CheckCount"]())
+        self.assertIs(result, True)
+        url, kwargs, thread_id = self.requests.calls[0]
+        self.assertEqual(url, "https://tracker.test/room/123")
+        self.assertEqual(kwargs, {"timeout": 15})
+        self.assertNotEqual(thread_id, main_thread)
+        self.assertEqual(self.requests.response.raise_calls, 1)
 
-    def test_post_daily_stats_attempts_check_graph_after_death_failure(self):
+    def test_check_count_returns_false_on_http_error(self):
+        self.requests.response.error = RuntimeError("HTTP 500")
+        result = asyncio.run(self.ns["Command_CheckCount"]())
+        self.assertIs(result, False)
+        self.assertEqual(self.requests.response.raise_calls, 1)
+        self.debug.send.assert_awaited_once_with("ERROR IN CHECKCOUNT")
+
+    def test_post_daily_stats_attempts_reports_in_requested_order(self):
+        attempted = []
+
+        async def checkcount():
+            attempted.append("count")
+            return True
+
+        async def checkgraph():
+            attempted.append("graph")
+            return True
+
+        async def deathcount():
+            attempted.append("death")
+            return True
+
+        self.ns.update({
+            "Command_CheckCount": checkcount,
+            "Command_CheckGraph": checkgraph,
+            "Command_DeathCount": deathcount,
+        })
+        asyncio.run(self.ns["PostDailyStats"]())
+        self.assertEqual(attempted, ["count", "graph", "death"])
+
+    def test_post_daily_stats_attempts_all_reports_after_failure(self):
         os.remove(self.paths["deathlog"])
         with self.assertRaises(RuntimeError) as raised:
             asyncio.run(self.ns["PostDailyStats"]())
         self.assertIn("death count did not deliver", str(raised.exception))
-        self.assertNotIn("check graph", str(raised.exception))
-        self.assertEqual(len(self.requests.calls), 1)
+        self.assertEqual(len(self.requests.calls), 2)
+
+    def test_post_daily_stats_reports_check_count_failure_and_continues(self):
+        self.requests.error = RuntimeError("tracker offline")
+        with self.assertRaises(RuntimeError) as raised:
+            asyncio.run(self.ns["PostDailyStats"]())
+        self.assertIn("check count did not deliver", str(raised.exception))
+        self.assertIn("check graph did not deliver", str(raised.exception))
+        self.assertEqual(self.main.send.await_count, 2)
+        self.assertEqual(len(self.requests.calls), 2)
 
     def test_post_daily_stats_reports_check_graph_failure_after_death_delivery(self):
         self.requests.error = RuntimeError("tracker offline")
@@ -260,11 +305,16 @@ class DailyPostCommandTests(unittest.TestCase):
             attempted.append("graph")
             return True
 
+        async def checkcount():
+            attempted.append("count")
+            return True
+
         self.ns["Command_DeathCount"] = deathcount
         self.ns["Command_CheckGraph"] = checkgraph
+        self.ns["Command_CheckCount"] = checkcount
         with self.assertRaises(RuntimeError) as raised:
             asyncio.run(self.ns["PostDailyStats"]())
-        self.assertEqual(attempted, ["death", "graph"])
+        self.assertEqual(attempted, ["count", "graph", "death"])
         self.assertIn("death count raised RuntimeError: boom", str(raised.exception))
 
 

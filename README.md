@@ -135,7 +135,7 @@ Hopefully that makes sense.
 |||
 |**Item Filter Config**||
 |`BotItemSpoilTraps`|The Bot will spoil traps by posting them in chat and ketchmeup [3]|
-|`BotItemFilterLevel`|Sets the bot filter level `0` - `1` - `2`, to exclude items from discord posts [3]|
+|`BotItemFilterLevel`|Sets the bot filter level `0` - `1` - `2`, to exclude items from Discord posts [3]. This is read from your local `config.json`, which is ignored by git; it is not hardcoded.|
 ||All items are still be queued for ketchmeup|
 ||`2` - Only Logical Progression Items|
 ||`1` - Logical + Useful items|
@@ -172,12 +172,12 @@ Hopefully that makes sense.
 |`DiscordBridgeEnabled`|Will toggle the ability to send messages to AP from Discord|
 |||
 |**Daily Post Config**||
-|`Enabled`|Post `$deathcount` and `$checkgraph` results to the broadcast channel once per local day (default: `false`)|
+|`Enabled`|Post `$checkcount`, `$checkgraph`, and `$deathcount` results to the broadcast channel once per local day, in that order (default: `false`)|
 |`Time`|Local 24-hour `HH:MM` time for the daily post (default: `00:00`)|
 |`Timezone`|IANA timezone for `Time` and the once-per-day date, e.g. `America/New_York` (default: `America/New_York`)|
 ||Daylight saving changes are handled automatically. The bot waits for the next configured time after startup and does not catch up on a post missed while the bot was stopped. If the process is suspended across the scheduled time, it may still deliver that missed post late once after it resumes.|
 ||The last posted local date is stored in `logs/<UniqueID>/DailyPostState.json`, so reconnects and restarts cannot post twice in one day.|
-||Each report is attempted once per day. A failed report is logged and not retried the same day; the bot tries again at the next day's scheduled time.|
+||Each report is attempted once per day in order: `$checkcount`, `$checkgraph`, then `$deathcount`. A failed report does not prevent later reports from running. Failures are logged and not retried the same day; the bot tries again at the next day's scheduled time.|
 ||`SelfHostNoWeb` mode disables the check graph, so daily posts require the tracker web page.|
 |||
 |**Meta Config**||

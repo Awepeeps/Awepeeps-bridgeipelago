@@ -112,18 +112,23 @@ class DailyPostStartupTests(unittest.TestCase):
     def test_daily_post_reuses_existing_broadcast_commands(self):
         calls = []
 
-        async def deathcount():
-            calls.append("deathcount")
+        async def checkcount():
+            calls.append("checkcount")
             return True
 
         async def checkgraph():
             calls.append("checkgraph")
             return True
 
+        async def deathcount():
+            calls.append("deathcount")
+            return True
+
+        self.ns["Command_CheckCount"] = checkcount
         self.ns["Command_DeathCount"] = deathcount
         self.ns["Command_CheckGraph"] = checkgraph
         asyncio.run(self.ns["PostDailyStats"]())
-        self.assertEqual(calls, ["deathcount", "checkgraph"])
+        self.assertEqual(calls, ["checkcount", "checkgraph", "deathcount"])
 
 
 if __name__ == "__main__":

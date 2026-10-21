@@ -2,6 +2,7 @@ import ast
 import json
 import threading
 import unittest
+from multiprocessing import Manager
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,7 @@ def load_tracker_client():
     tree = ast.parse((ROOT / "bridgeipelago.py").read_text(encoding="utf-8"))
     selected = [
         node for node in tree.body
-        if (isinstance(node, ast.FunctionDef) and node.name in {"QueueRoomSleepNotice", "QueueRoomWakeNotice", "QueueRoomUnavailableNotice"})
+        if (isinstance(node, ast.FunctionDef) and node.name in {"RenderConnectionNotification", "GetConnectionNotificationPlaceholders", "QueueRoomSleepNotice", "QueueRoomWakeNotice", "QueueRoomUnavailableNotice"})
         or (isinstance(node, ast.ClassDef) and node.name == "TrackerClient")
     ]
     namespace = {
@@ -30,6 +31,8 @@ def load_tracker_client():
             "ArchipelagoServer": "localhost", "ArchipelagoPort": 38281,
             "ArchipelagoBotSlot": "bot", "ArchipelagoServerURL": "https://archipelago.gg/room/abc",
         }, "AdvancedConfig": {"DebugMode": False, "QueueOverclock": 1}},
+        "DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE": "Archipelago connection unavailable. {room_url}",
+        "DEFAULT_CONNECTION_RESTORED_MESSAGE": "Archipelago connection restored: {server_address}",
         "RoomAsleep": False, "ConnectionUnavailableSince": None, "chat_queue": FakeQueue(), "websocket_queue": FakeQueue(),
         "discordbridge_queue": SimpleNamespace(empty=lambda: True),
         "GetArchPassword": lambda: "", "typing": SimpleNamespace(Any=object), "Enum": Enum,
@@ -100,16 +103,95 @@ class RoomSleepNoticeTests(unittest.TestCase):
         namespace["QueueRoomUnavailableNotice"]()
         self.assertEqual(len(namespace["chat_queue"].messages), 1)
         text = namespace["chat_queue"].messages[0]["data"]["text"]
-        self.assertTrue(text.startswith("\U0001f4a4 The Archipelago room"))
-        self.assertIn("room may be asleep", text)
+        self.assertEqual(text, "Archipelago connection unavailable. <https://archipelago.gg/room/abc>")
         self.assertIn("<https://archipelago.gg/room/abc>", text)
         client.is_closed.clear()
         client.ap_connection = FakeConnection(json.dumps([{"cmd": "Connected"}]), client)
         client.run()
         self.assertFalse(namespace["RoomAsleep"])
         self.assertEqual(len(namespace["chat_queue"].messages), 2)
-        self.assertIn("\u2600\ufe0f The Archipelago room is reachable again", namespace["chat_queue"].messages[1]["data"]["text"])
-        self.assertNotIn("awake", namespace["chat_queue"].messages[1]["data"]["text"])
+        self.assertEqual(namespace["chat_queue"].messages[1]["data"]["text"], "Archipelago connection restored: archipelago.gg:38281")
+
+    def test_emoji_templates_and_custom_text_are_preserved_with_dynamic_values(self):
+        _, namespace = load_tracker_client()
+        namespace["CoreConfig"]["NotificationConfig"] = {
+            "ConnectionUnavailableMessage": "💤 custom {room_url}",
+            "ConnectionRestoredMessage": "☀️ again at **{server_address}**",
+        }
+        namespace["QueueRoomSleepNotice"](SimpleNamespace(code=1001))
+        namespace["time"].monotonic = lambda: 61
+        namespace["QueueRoomUnavailableNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[0]["data"]["text"], "💤 custom <https://archipelago.gg/room/abc>")
+        namespace["CoreConfig"]["ArchipelagoConfig"]["ArchipelagoServerURL"] = "https://my.host/room/id"
+        namespace["CoreConfig"]["ArchipelagoConfig"]["ArchipelagoPort"] = 555
+        namespace["QueueRoomWakeNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[1]["data"]["text"], "☀️ again at **my.host:555**")
+
+    def test_both_placeholders_are_supported_in_both_notice_templates(self):
+        _, namespace = load_tracker_client()
+        namespace["CoreConfig"]["NotificationConfig"] = {
+            "ConnectionUnavailableMessage": "down {room_url} {server_address}",
+            "ConnectionRestoredMessage": "up {room_url} {server_address}",
+        }
+        namespace["QueueRoomSleepNotice"](SimpleNamespace(code=1001))
+        namespace["time"].monotonic = lambda: 61
+        namespace["QueueRoomUnavailableNotice"]()
+        expected = "down <https://archipelago.gg/room/abc> archipelago.gg:38281"
+        self.assertEqual(namespace["chat_queue"].messages[0]["data"]["text"], expected)
+        namespace["RoomAsleep"] = True
+        namespace["QueueRoomWakeNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[1]["data"]["text"], "up <https://archipelago.gg/room/abc> archipelago.gg:38281")
+
+    def test_dictproxy_notification_config_works(self):
+        _, namespace = load_tracker_client()
+        with Manager() as manager:
+            namespace["CoreConfig"]["NotificationConfig"] = manager.dict({
+                "ConnectionUnavailableMessage": "down {room_url} {server_address}",
+            })
+            namespace["QueueRoomSleepNotice"](SimpleNamespace(code=1001))
+            namespace["time"].monotonic = lambda: 61
+            namespace["QueueRoomUnavailableNotice"]()
+            self.assertEqual(namespace["chat_queue"].messages[0]["data"]["text"], "down <https://archipelago.gg/room/abc> archipelago.gg:38281")
+
+    def test_template_contains_emoji_overrides_and_default_config_has_plain_fallbacks(self):
+        template = json.loads((ROOT / "config.json.template").read_text(encoding="utf-8"))
+        notifications = template["NotificationConfig"]
+        self.assertIn("💤", notifications["ConnectionUnavailableMessage"])
+        self.assertIn("{room_url}", notifications["ConnectionUnavailableMessage"])
+        self.assertIn("☀️", notifications["ConnectionRestoredMessage"])
+        self.assertIn("{server_address}", notifications["ConnectionRestoredMessage"])
+        _, namespace = load_tracker_client()
+        self.assertEqual(namespace["DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE"], "Archipelago connection unavailable. {room_url}")
+        self.assertEqual(namespace["DEFAULT_CONNECTION_RESTORED_MESSAGE"], "Archipelago connection restored: {server_address}")
+
+    def test_missing_malformed_and_empty_notification_config_fall_back(self):
+        for malformed in (None, [], "bad"):
+            _, namespace = load_tracker_client()
+            namespace["CoreConfig"]["NotificationConfig"] = malformed
+            namespace["QueueRoomSleepNotice"](SimpleNamespace(code=1001))
+            namespace["time"].monotonic = lambda: 61
+            namespace["QueueRoomUnavailableNotice"]()
+            self.assertEqual(namespace["chat_queue"].messages[0]["data"]["text"], "Archipelago connection unavailable. <https://archipelago.gg/room/abc>")
+        _, namespace = load_tracker_client()
+        namespace["CoreConfig"]["NotificationConfig"] = {"ConnectionUnavailableMessage": "", "ConnectionRestoredMessage": 7}
+        namespace["QueueRoomSleepNotice"](SimpleNamespace(code=1001))
+        namespace["time"].monotonic = lambda: 61
+        namespace["QueueRoomUnavailableNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[0]["data"]["text"], "Archipelago connection unavailable. <https://archipelago.gg/room/abc>")
+        namespace["RoomAsleep"] = True
+        namespace["QueueRoomWakeNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[1]["data"]["text"], "Archipelago connection restored: archipelago.gg:38281")
+
+        namespace["CoreConfig"]["NotificationConfig"] = {"ConnectionUnavailableMessage": " \t\n", "ConnectionRestoredMessage": " \t\n"}
+        namespace["RoomAsleep"] = False
+        namespace["ConnectionUnavailableSince"] = None
+        namespace["time"].monotonic = lambda: 0
+        namespace["QueueRoomSleepNotice"](SimpleNamespace(code=1001))
+        namespace["time"].monotonic = lambda: 61
+        namespace["QueueRoomUnavailableNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[2]["data"]["text"], "Archipelago connection unavailable. <https://archipelago.gg/room/abc>")
+        namespace["QueueRoomWakeNotice"]()
+        self.assertEqual(namespace["chat_queue"].messages[3]["data"]["text"], "Archipelago connection restored: archipelago.gg:38281")
 
     def test_connected_without_sleep_flag_does_not_queue_notice(self):
         client, namespace = self.make_client()

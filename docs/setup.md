@@ -92,6 +92,9 @@ You're done with the bot portal for now, but keep that token handy!
   1. The bot waits for the next configured time after startup rather than posting immediately, and it remembers the last posted local date in `logs/<UniqueID>/DailyPostState.json` so restarts do not repeat a day. If the process is suspended across the scheduled time, the missed post may still be delivered late once after it resumes.
   1. Each report is attempted once per day. A failed report does not prevent later reports from running. Failures are logged and not retried the same day; the bot tries again at the next day's scheduled time.
   1. `SelfHostNoWeb` mode disables the check graph, so daily posts need the tracker web page.
+- Notification Config (optional)
+  1. `ConnectionUnavailableMessage` and `ConnectionRestoredMessage` customize notices sent after a prolonged room disconnect and after recovery. The built-in defaults are plain text.
+  1. Use `{room_url}` for the room URL (the bot supplies `<` and `>` around it to suppress Discord embeds) and `{server_address}` for the plain `host:port` value. Other text, including emoji, is sent as written. Missing, malformed, empty, or non-string values fall back to the built-in messages.
 
 You're free to leave the Advanced Config section as-is unless you know what you're doing.  
 Detailed references for the `config.json` can be found on the main [Readme](/README.md)

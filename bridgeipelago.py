@@ -179,6 +179,37 @@ RoomAsleep = False
 ConnectionUnavailableSince = None
 DailyPostTask = None
 
+DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE = "Archipelago connection unavailable. {room_url}"
+DEFAULT_CONNECTION_RESTORED_MESSAGE = "Archipelago connection restored: {server_address}"
+
+def RenderConnectionNotification(message_key, default_message, placeholders):
+    """Render a configurable connection notice, falling back safely for bad config."""
+    notification_config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(notification_config, "get", None)):
+        notification_config = {}
+    message = notification_config.get(message_key)
+    if not isinstance(message, str) or not message.strip():
+        message = default_message
+    for placeholder, value in placeholders.items():
+        message = message.replace("{" + placeholder + "}", str(value))
+    return message
+
+def GetConnectionNotificationPlaceholders():
+    """Build the values shared by unavailable and restored notices."""
+    archipelago_config = CoreConfig.get("ArchipelagoConfig", {})
+    if not callable(getattr(archipelago_config, "get", None)):
+        archipelago_config = {}
+    room_url = archipelago_config.get("ArchipelagoServerURL", "")
+    try:
+        room_host = room_url.split("/")[2]
+    except (AttributeError, IndexError):
+        room_host = ""
+    room_port = archipelago_config.get("ArchipelagoPort", "")
+    return {
+        "room_url": "<" + str(room_url) + ">",
+        "server_address": str(room_host) + ":" + str(room_port),
+    }
+
 ## These are the main queues for processing data from the Archipelago Tracker to the Discord Bot
 ### Main Processing Queues
 item_queue = Queue()
@@ -210,9 +241,9 @@ def QueueRoomWakeNotice():
     if not RoomAsleep:
         ConnectionUnavailableSince = None
         return
-    RoomHost = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"].split("/")[2]
-    RoomPort = CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]
-    chat_queue.put({"type": "CORE", "data": {"text": "\u2600\ufe0f The Archipelago room is reachable again at **" + str(RoomHost) + ":" + str(RoomPort) + "**."}, "flag": "None"})
+    placeholders = GetConnectionNotificationPlaceholders()
+    message = RenderConnectionNotification("ConnectionRestoredMessage", DEFAULT_CONNECTION_RESTORED_MESSAGE, placeholders)
+    chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "None"})
     RoomAsleep = False
     ConnectionUnavailableSince = None
 
@@ -221,8 +252,9 @@ def QueueRoomUnavailableNotice():
     if ConnectionUnavailableSince is None or RoomAsleep or time.monotonic() - ConnectionUnavailableSince < 60:
         return
     if not RoomAsleep:
-        RoomURL = CoreConfig["ArchipelagoConfig"]["ArchipelagoServerURL"]
-        chat_queue.put({"type": "CORE", "data": {"text": "\U0001f4a4 The Archipelago room may be asleep (connection unavailable). Open <" + str(RoomURL) + "> to wake it up."}, "flag": "None"})
+        placeholders = GetConnectionNotificationPlaceholders()
+        message = RenderConnectionNotification("ConnectionUnavailableMessage", DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE, placeholders)
+        chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "None"})
         RoomAsleep = True
 
 #Discord Bot Initialization

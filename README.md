@@ -180,6 +180,11 @@ Hopefully that makes sense.
 ||Each report is attempted once per day in order: `$checkcount`, `$checkgraph`, then `$deathcount`. A failed report does not prevent later reports from running. Failures are logged and not retried the same day; the bot tries again at the next day's scheduled time.|
 ||`SelfHostNoWeb` mode disables the check graph, so daily posts require the tracker web page.|
 |||
+|**Notification Config**||
+|`ConnectionUnavailableMessage`|Message sent after a sustained Archipelago disconnect. Defaults to `Archipelago connection unavailable. {room_url}`. `{room_url}` is wrapped in `<` and `>` to suppress Discord link embeds.|
+|`ConnectionRestoredMessage`|Message sent after a room connection recovers. Defaults to `Archipelago connection restored: {server_address}`. `{server_address}` is the plain host and port, such as `archipelago.gg:38281`.|
+||Both messages support literal `{room_url}` and `{server_address}` substitutions. Empty or non-string values use the plain text default.|
+|||
 |**Meta Config**||
 |`FlavorDeathLink`|Will change deathlink messages to have a little more personality [4]|
 |`DeathLinkLottery`|Unused... for now >:) |

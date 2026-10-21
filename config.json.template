@@ -54,6 +54,10 @@
         "Time": "00:00",
         "Timezone": "America/New_York"
     },
+    "NotificationConfig": {
+        "ConnectionUnavailableMessage": "💤 The Archipelago room may be asleep. Open {room_url} to wake it up.",
+        "ConnectionRestoredMessage": "☀️ The Archipelago room is reachable again at **{server_address}**."
+    },
     "MetaConfig": {
         "FlavorDeathlink": false,
         "DeathlinkLottery": false

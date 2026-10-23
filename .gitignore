@@ -8,6 +8,8 @@ bot/
 bot.py
 test/
 config.json
+config.json.bak*
+bot.out
 
 .idea/
 

@@ -18,6 +18,7 @@
 
 
 #Core Dependencies
+import asyncio
 import json
 import typing
 import uuid
@@ -25,6 +26,7 @@ import os
 import sys
 from enum import Enum
 import logging
+import hashlib
 
 #Threading Dependencies
 from threading import Thread, Event
@@ -48,6 +50,23 @@ from bs4 import BeautifulSoup
 from discord.ext import tasks
 import discord
 from discord import app_commands
+from modules.player_commands import HINT_FIELD_MAX_LENGTH, HINT_NOT_REGISTERED_MESSAGE, register_player_commands
+from modules.daily_post import (
+    DailyPostConfigError,
+    DailyPostState,
+    load_daily_post_settings,
+    run_daily_posts,
+)
+from modules.hint_relay import (
+    HintRelayState,
+    deliver_pending_hints,
+    format_hint_status,
+    hint_subscription_keys,
+    normalize_requested_hint,
+    render_hint_message,
+    unused_corrupt_path,
+)
+from modules.item_notifications import ItemNotificationState
 import time
 
 # Bridgeipelago Optional Modules
@@ -119,6 +138,38 @@ def GetCoreDirectory(folder):
         return str(os.getcwd() + CoreConfig["AdvancedConfig"]["ArchipelagoDataDirectory"] + CoreConfig["ArchipelagoConfig"]['UniqueID'] + '/')
     elif folder == "core":
         return str(os.getcwd())
+
+ItemQueueSafeChars = frozenset("0123456789 _.-")
+ItemQueueReservedNames = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + ["com" + str(number) for number in range(10)]
+    + ["lpt" + str(number) for number in range(10)]
+)
+
+def ItemQueueFileFor(slot):
+    # A slot name becomes a file name. Ordinary names (letters of any script,
+    # ASCII digits, space, _, -, .) keep the historical "<name>.csv"; every other
+    # character is percent-encoded, so the result can never contain a separator,
+    # ':' (an NTFS stream), or a Windows device name.
+    if slot is None:
+        return None
+    Name = str(slot).strip().lower()
+    if not Name:
+        return None
+    Encoded = "".join(
+        char if char in ItemQueueSafeChars or char.isalpha()
+        else "".join("%{:02X}".format(byte) for byte in char.encode("utf-8", "surrogatepass"))
+        for char in Name
+    )
+    if Name in (".", ".."):
+        Encoded = Encoded.replace(".", "%2E")
+    Base = Encoded.split(".", 1)[0].rstrip(" ")
+    if Base in ItemQueueReservedNames:
+        # Encode the first letter instead of adding a prefix: "_con" is a real
+        # slot whose file is "_con.csv", and encoding never yields "%63" etc.
+        # because the letters themselves are safe characters.
+        Encoded = "%{:02X}".format(ord(Encoded[0])) + Encoded[1:]
+    return GetCoreDirectory("item") + Encoded + ".csv"
     
 def GetCoreFiles(file):
     global CoreConfig
@@ -145,6 +196,10 @@ def GetCoreFiles(file):
         return GetCoreDirectory("arch") + 'ArchRoomData.json'
     elif file == "archstatus":
         return GetCoreDirectory("arch") + 'ArchStatus.json'
+    elif file == "hintrelay":
+        return GetCoreDirectory("log") + 'HintRelay.json'
+    elif file == "itemnotifications":
+        return GetCoreDirectory("reg") + 'ItemNotifications.json'
     elif file == "lang":
         return GetCoreDirectory("core") + CoreConfig["MetaConfig"]["LanguageFile"] + ".lang"
 
@@ -167,6 +222,44 @@ def SetupLogger():
 ReconnectionTimer = 5
 discord_client = None
 tracker_client = None
+RoomAsleep = False
+ConnectionUnavailableSince = None
+DailyPostTask = None
+HintRelayTeam = None
+HintRelayStateInstance = None
+ItemNotificationStateInstance = None
+PlayerCommandsSyncedEnabled = None
+
+DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE = "Archipelago connection unavailable. {room_url}"
+DEFAULT_CONNECTION_RESTORED_MESSAGE = "Archipelago connection restored: {server_address}"
+
+def RenderConnectionNotification(message_key, default_message, placeholders):
+    """Render a configurable connection notice, falling back safely for bad config."""
+    notification_config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(notification_config, "get", None)):
+        notification_config = {}
+    message = notification_config.get(message_key)
+    if not isinstance(message, str) or not message.strip():
+        message = default_message
+    for placeholder, value in placeholders.items():
+        message = message.replace("{" + placeholder + "}", str(value))
+    return message
+
+def GetConnectionNotificationPlaceholders():
+    """Build the values shared by unavailable and restored notices."""
+    archipelago_config = CoreConfig.get("ArchipelagoConfig", {})
+    if not callable(getattr(archipelago_config, "get", None)):
+        archipelago_config = {}
+    room_url = archipelago_config.get("ArchipelagoServerURL", "")
+    try:
+        room_host = room_url.split("/")[2]
+    except (AttributeError, IndexError):
+        room_host = ""
+    room_port = archipelago_config.get("ArchipelagoPort", "")
+    return {
+        "room_url": "<" + str(room_url) + ">",
+        "server_address": str(room_host) + ":" + str(room_port),
+    }
 
 ## These are the main queues for processing data from the Archipelago Tracker to the Discord Bot
 ### Main Processing Queues
@@ -182,6 +275,38 @@ lottery_queue = Queue()
 discordbridge_queue = Queue()
 hint_queue = Queue()
 hintprocessing_queue = Queue()
+
+def QueueRoomSleepNotice(close_frame=None):
+    """Record a 1001 disconnect; it does not establish that the room is asleep."""
+    global ConnectionUnavailableSince
+    if close_frame is None or getattr(close_frame, "code", None) != 1001:
+        return
+    if ConnectionUnavailableSince is None:
+        ConnectionUnavailableSince = time.monotonic()
+
+def QueueRoomWakeNotice():
+    global RoomAsleep, ConnectionUnavailableSince, CoreConfig
+    if ConnectionUnavailableSince is None:
+        return
+    # Recovery before a notice was emitted is a transient reconnect, so stay quiet.
+    if not RoomAsleep:
+        ConnectionUnavailableSince = None
+        return
+    placeholders = GetConnectionNotificationPlaceholders()
+    message = RenderConnectionNotification("ConnectionRestoredMessage", DEFAULT_CONNECTION_RESTORED_MESSAGE, placeholders)
+    chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "ROOM_WAKE"})
+    RoomAsleep = False
+    ConnectionUnavailableSince = None
+
+def QueueRoomUnavailableNotice():
+    global RoomAsleep, ConnectionUnavailableSince, CoreConfig
+    if ConnectionUnavailableSince is None or RoomAsleep or time.monotonic() - ConnectionUnavailableSince < 60:
+        return
+    if not RoomAsleep:
+        placeholders = GetConnectionNotificationPlaceholders()
+        message = RenderConnectionNotification("ConnectionUnavailableMessage", DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE, placeholders)
+        chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "ROOM_SLEEP"})
+        RoomAsleep = True
 
 #Discord Bot Initialization
 intents = discord.Intents.default()
@@ -199,7 +324,7 @@ except Exception as e:
     print("!!! Error: " + str(e))
     OverClockValue = 1
 #TO DO - Central Control for bot I'll just leave this in for now.
-DiscordGuildID = 1171964435741544498
+PlayerCommandsSyncedGuild = None
 
 ## ARCHIPELAGO TRACKER CLIENT + CORE FUNCTION
 class TrackerClient():
@@ -208,6 +333,10 @@ class TrackerClient():
     tags: set[str] = {'TextOnly','Tracker', 'DeathLink'}
     version: dict[str, any] = {"major": 0, "minor": 6, "build": 8, "class": "Version"}
     items_handling: int = 0b000  # This client does not receive any items
+    # SetReply packets can arrive before the initial Retrieved baseline. Keep
+    # only the newest few per store so a misbehaving server cannot grow this
+    # buffer without bound.
+    HINT_PREBASELINE_REPLY_LIMIT: int = 8
 
     class MessageCommand(Enum):
         BOUNCED = 'Bounced'
@@ -231,10 +360,16 @@ class TrackerClient():
         self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
         self.is_closed = Event()
+        self.hint_baseline_keys = set()
+        self.hint_store_keys = set()
+        self.hint_prebaseline_replies = {}
 
     def run(self):
         #=== Main Run Loop ===
         global CoreConfig
+        LastReceivedTime = time.monotonic()
+        OutstandingPing = None
+        PingSentTime = None
         try:
             """Handles incoming messages from the Archipelago MultiServer."""
             
@@ -242,6 +377,9 @@ class TrackerClient():
                 #=== Message Loop ===#
                 try:
                     RawMessage = self.ap_connection.recv(timeout=float(CoreConfig["AdvancedConfig"]["QueueOverclock"]))
+                    LastReceivedTime = time.monotonic()
+                    OutstandingPing = None
+                    PingSentTime = None
                     for i in range(len(json.loads(RawMessage))):
                         args: dict = json.loads(RawMessage)[i]
                         cmd = args.get('cmd')
@@ -257,15 +395,52 @@ class TrackerClient():
                         elif cmd == self.MessageCommand.DATA_PACKAGE.value:
                             WriteDataPackage(args)
                         elif cmd == self.MessageCommand.CONNECTED.value:
+                            QueueRoomWakeNotice()
                             WriteArchConnectionJSON(args)
                             print("-- Tracker connected to server.")
+                            if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                                self.subscribe_hint_results(args)
+                        elif cmd == 'Retrieved' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                            retrieved = args.get('keys', {})
+                            baseline_count = 0
+                            baseline_hints = 0
+                            if isinstance(retrieved, dict):
+                                for key, values in retrieved.items():
+                                    key = str(key)
+                                    # Only keys we subscribed to become baselines.
+                                    if key not in self.hint_baseline_keys:
+                                        continue
+                                    self.hint_baseline_keys.remove(key)
+                                    # A null or otherwise non-list store is an
+                                    # empty baseline. Otherwise its first
+                                    # SetReply would be silently baselined.
+                                    if not isinstance(values, list):
+                                        values = []
+                                    baseline_count += 1
+                                    baseline_hints += len(values)
+                                    self.queue_hint_snapshot(key, values)
+                                    for early_values in self.hint_prebaseline_replies.pop(key, []):
+                                        self.queue_hint_snapshot(key, early_values)
+                            print("-- Hint relay baseline processed: {} stores, {} hints.".format(baseline_count, baseline_hints))
+                        elif cmd == 'SetReply' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                            values = args.get('value')
+                            if isinstance(values, list):
+                                key = str(args.get('key', ''))
+                                if key not in self.hint_store_keys:
+                                    continue
+                                if key in self.hint_baseline_keys:
+                                    self.buffer_prebaseline_reply(key, values)
+                                else:
+                                    self.queue_hint_snapshot(key, values)
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
                             print("Tracker Connection refused by server - check your slot name / port / whatever, and try again.")
                             WriteToErrorLog("Websocket", "Tracker Connection refused by server - check your slot name / port / whatever, and try again.")
                             WriteToErrorLog("Websocket", str(args))
                             seppuku_queue.put(args)
                         elif cmd == self.MessageCommand.PRINT_JSON.value:
-                            if args.get('type') == 'ItemSend':
+                            if args.get('type') == 'Hint' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                                pass  # Hint PrintJSON is not sent to spectator clients; SetReply is authoritative.
+                            elif args.get('type') == 'ItemSend':
                                 item_queue.put(args)
                             elif args.get('type') == 'Chat':
                                 if CoreConfig["RelayConfig"]["ChatMessages"] == True:
@@ -295,10 +470,12 @@ class TrackerClient():
                         pass
                 except websockets.exceptions.ConnectionClosedError as e:
                     WriteToErrorLog("Websocket", "Tracker ConnectionClosedError: " + str(e))
+                    QueueRoomSleepNotice(getattr(e, "rcvd", None))
                     websocket_queue.put("!! Tracker ConnectionClosedError ...")
                     break
                 except websockets.exceptions.ConnectionClosed as e:
                     WriteToErrorLog("Websocket", "Tracker ConnectionClosed: " + str(e))
+                    QueueRoomSleepNotice(getattr(e, "rcvd", None))
                     websocket_queue.put("!! Tracker ConnectionClosed ...")
                     break
                 except websockets.exceptions.InvalidState as e:
@@ -311,6 +488,19 @@ class TrackerClient():
                     WriteToErrorLog("Websocket", "Tracker Unspecified Exception: " + str(e))
                     websocket_queue.put("!! Tracker Unspecified Exception !?!?!?!? ...")
                     break
+                CurrentTime = time.monotonic()
+                if OutstandingPing is not None:
+                    if OutstandingPing.is_set():
+                        LastReceivedTime = CurrentTime
+                        OutstandingPing = None
+                        PingSentTime = None
+                    elif CurrentTime - PingSentTime >= 20:
+                        WriteToErrorLog("Websocket", "Tracker keepalive ping timed out after 20 seconds.")
+                        websocket_queue.put("!! Tracker keepalive timeout ...")
+                        break
+                elif CurrentTime - LastReceivedTime >= 60:
+                    OutstandingPing = self.ap_connection.ping()
+                    PingSentTime = CurrentTime
                 #=== End Message Loop ===#
 
                 if not discordbridge_queue.empty():
@@ -358,6 +548,35 @@ class TrackerClient():
     def send_message(self, message: dict) -> None:
         self.ap_connection.send(json.dumps([message]))
 
+    def send_messages(self, messages: list[dict]) -> None:
+        self.ap_connection.send(json.dumps(messages))
+
+    def subscribe_hint_results(self, connected: dict) -> None:
+        global HintRelayTeam
+        team, keys = hint_subscription_keys(connected)
+        HintRelayTeam = team
+        self.hint_baseline_keys = set(keys)
+        self.hint_store_keys = set(keys)
+        self.hint_prebaseline_replies = {}
+        print("-- Hint relay connected; subscribing to {} same-team hint stores.".format(len(keys)))
+        if keys:
+            self.send_messages([
+                {"cmd": "SetNotify", "keys": keys},
+                {"cmd": "Get", "keys": keys},
+            ])
+
+    def buffer_prebaseline_reply(self, key: str, values: list) -> None:
+        replies = self.hint_prebaseline_replies.setdefault(key, [])
+        replies.append(values)
+        del replies[:-self.HINT_PREBASELINE_REPLY_LIMIT]
+
+    def queue_hint_snapshot(self, key: str, values: list) -> None:
+        values = [dict(hint) if isinstance(hint, dict) else hint for hint in values]
+        for hint in values:
+            if isinstance(hint, dict):
+                hint.setdefault("team", HintRelayTeam)
+        chat_queue.put({"type": "HINT_SNAPSHOT", "data": {"key": key, "hints": values}, "flag": "None"})
+
     def stop(self) -> None:
         self.is_closed.set()
         self.ap_connection.close()
@@ -379,6 +598,10 @@ class TrackerClient():
         except Exception as e:
             print("Error while trying to connect to Archipelago MultiServer:")
             print(e)
+            if isinstance(e, ConnectionRefusedError) or getattr(e, "errno", None) == 111 or getattr(e, "winerror", None) == 10061:
+                # Refusal is not evidence that the room is asleep. If a 1001
+                # candidate exists, retry attempts let the debounce mature.
+                QueueRoomUnavailableNotice()
             websocket_queue.put("!! Tracker start error...")
 
 ## ARCHIPELAGO HINT CLIENT + CORE FUNCTION
@@ -411,6 +634,7 @@ class HintClient:
         self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
         self.is_closed = Event()
+        self.team = None
         self.hintqueuepayload = hintprocessing_queue.get()
 
     def run(self):
@@ -430,6 +654,7 @@ class HintClient:
                             self.send_connect()
                         elif cmd == self.MessageCommand.CONNECTED.value:
                             print("-- HintClient received CONNECTED.")
+                            self.team = args.get('team')
                             self.process_hint()
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
                             print("HintClient CONNECTION_REFUSED by server - check your slot name / port / whatever, and try again.")
@@ -438,7 +663,11 @@ class HintClient:
                             chat_queue.put(MessageObject)
                         elif cmd == self.MessageCommand.PRINT_JSON.value:
                             if args.get('type') == 'Hint':
-                                chat_queue.put(MessageObject)
+                                if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                                    hint = normalize_requested_hint(args, self.team)
+                                    chat_queue.put({"type": "HINT_REQUESTED", "data": hint, "flag": "None"})
+                                else:
+                                    chat_queue.put(MessageObject)
                             elif args.get('type') == 'CommandResult':
                                 chat_queue.put(MessageObject)
                             elif args.get('type') == 'Join' or args.get('type') == 'Tutorial' or args.get('type') == 'Chat':
@@ -529,27 +758,274 @@ class HintClient:
 
 
 ## DISCORD EVENT HANDLERS + CORE FUNTION
+async def PostDailyStats():
+    failures = []
+    reports = (
+        ("check count", Command_CheckCount),
+        ("check graph", Command_CheckGraph),
+        ("death count", Command_DeathCount),
+    )
+    # Try every report even if one fails, so a broken report does not
+    # hide the other one. The scheduler logs the raised error and tries again
+    # at the next day's scheduled time rather than retrying later today.
+    for name, report in reports:
+        try:
+            delivered = await report()
+        except Exception as error:
+            failures.append("%s raised %s: %s" % (
+                name, type(error).__name__, error
+            ))
+            continue
+        if delivered is False:
+            failures.append(name + " did not deliver")
+
+    if failures:
+        raise RuntimeError("; ".join(failures) + ".")
+
+def ReportDailyPostError(error):
+    message = "Daily post failed: " + str(error)
+    print("!!! " + message)
+    try:
+        WriteToErrorLog("DailyPost", message)
+    except Exception:
+        pass
+
+async def StartDailyPostScheduler():
+    global DailyPostTask
+    try:
+        settings = load_daily_post_settings(CoreConfig.get("DailyPostConfig"))
+    except DailyPostConfigError as error:
+        message = "Daily post configuration error: " + str(error)
+        print("!!! " + message)
+        try:
+            WriteToErrorLog("DailyPost", message)
+        except Exception:
+            pass
+        try:
+            await DebugChannel.send(message)
+        except Exception:
+            pass
+        return
+
+    if settings is None:
+        return
+    if DailyPostTask is not None and not DailyPostTask.done():
+        return
+
+    state = DailyPostState(
+        GetCoreDirectory("log") + "DailyPostState.json",
+        log=lambda message: print("!!! " + message),
+    )
+    DailyPostTask = discord_client.loop.create_task(
+        run_daily_posts(
+            settings,
+            state,
+            PostDailyStats,
+            on_error=ReportDailyPostError,
+        )
+    )
+    print("++ Daily post scheduled for %02d:%02d %s" % (
+        settings.hour, settings.minute, settings.timezone_name
+    ))
+
 @discord_client.event
 async def on_ready():
     global MainChannel
+    global PlayerCommandsSyncedEnabled
     MainChannel = discord_client.get_channel(int(CoreConfig["DiscordConfig"]["DiscordBroadcastChannel"]))
     #await MainChannel.send('Bot connected. Battle control - Online.')
     global DebugChannel
     DebugChannel = discord_client.get_channel(int(CoreConfig["DiscordConfig"]["DiscordDebugChannel"]))
-    await DebugChannel.send('Bot connected. Debug control - Online.')
-
-    # We wont sync the command tree for now, need to roll out central control first.
-    #await tree.sync(guild=discord.Object(id=DiscordGuildID))
+    if CoreConfig["DiscordConfig"].get("AnnounceConnection", False) and DebugChannel is not None:
+        await DebugChannel.send('Bot connected. Debug control - Online.')
 
     #Start background tasks
-    CheckArchHost.start()
-    ProcessItemQueue.start()
-    ProcessDeathQueue.start()
-    ProcessChatQueue.start()
-    CheckCommandQueue.start()
+    if not CheckArchHost.is_running():
+        CheckArchHost.start()
+    if not ProcessItemQueue.is_running():
+        ProcessItemQueue.start()
+    if not ProcessDeathQueue.is_running():
+        ProcessDeathQueue.start()
+    if not ProcessChatQueue.is_running():
+        ProcessChatQueue.start()
+    if not CheckCommandQueue.is_running():
+        CheckCommandQueue.start()
+    await StartDailyPostScheduler()
+
+    # Keep relay work available even if Discord command registration is unavailable.
+    global PlayerCommandsSyncedGuild
+    guild = getattr(MainChannel, "guild", None) if MainChannel is not None else None
+    if guild is None:
+        print("Player command sync skipped: configured broadcast channel is missing or has no guild.")
+    else:
+        guild_id = guild.id
+        if PlayerCommandsSyncedGuild != guild_id or PlayerCommandsSyncedEnabled != SlashCommandsEnabled():
+            guild_object = discord.Object(id=guild_id)
+            if SlashCommandsEnabled():
+                tree.copy_global_to(guild=guild_object)
+            else:
+                tree.clear_commands(guild=guild_object)
+            try:
+                await tree.sync(guild=guild_object)
+            except Exception as e:
+                print("Player command sync failed for configured guild:", getattr(e, "status", None), type(e).__name__)
+            else:
+                PlayerCommandsSyncedGuild = guild_id
+                PlayerCommandsSyncedEnabled = SlashCommandsEnabled()
 
     print("++ ",CoreConfig["AdvancedConfig"]["JoinMessage"])
     print("++ Async bot started -", discord_client.user)
+
+HelpText = """**Archipelago bot commands** (only work in this channel, lowercase)
+
+**Get started**
+`$register <slot>` - link your Discord to your slot (use your exact slot name)
+`$listreg` - DM you the slots you're registered for
+`$clearreg` - remove all your registrations
+
+**Catch up** (results come by DM)
+`$ketchmeup` - items other players sent you that you missed
+  `$ketchmeup 2` progression only, `1` + useful, `0` everything
+`$groupcheck <slot>` - all queued items for a slot
+`$hints` - hinted items for your registered slots
+`$notify off|all|watched` - turn item pings off, on for all registered slots, or only watched items
+`$watch <slot> | <item>` / `$unwatch <slot> | <item>` - watch or stop watching an item
+`$watches` - list your active item watches
+
+**Hints & progress**
+`$hint <slot> | <item>` - request a hint for a slot you're registered for, posted here
+`$checkcount` - check counts for everyone
+`$checkgraph` - progress graph
+`$deathcount` - DeathLink tally
+
+If the room moves to a new port, the bot posts the new address here."""
+
+def IsBotAdmin(author):
+    # Only trust the guild permissions supplied by Discord; never parse roles
+    # or names from the message itself.
+    permissions = getattr(author, "guild_permissions", None)
+    if permissions is None:
+        return False
+    return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
+
+def SlashCommandsEnabled():
+    config = CoreConfig.get("CommandConfig", {})
+    if not callable(getattr(config, "get", None)):
+        config = {}
+    value = config.get("SlashCommandsEnabled", True)
+    return value if isinstance(value, bool) else True
+
+def PrefixCommandsEnabled():
+    config = CoreConfig.get("CommandConfig", {})
+    if not callable(getattr(config, "get", None)):
+        config = {}
+    value = config.get("PrefixCommandsEnabled", True)
+    return value if isinstance(value, bool) else True
+
+def ItemNotificationsEnabled():
+    config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(config, "get", None)):
+        config = {}
+    return config.get("ItemMentionsEnabled", False) is True
+
+def GetItemNotificationState():
+    global ItemNotificationStateInstance
+    path = GetCoreFiles("itemnotifications")
+    if ItemNotificationStateInstance is None or ItemNotificationStateInstance.path != path:
+        ItemNotificationStateInstance = ItemNotificationState(path)
+    return ItemNotificationStateInstance
+
+def RegisteredSlotsFor(User):
+    path = GetCoreDirectory("reg") + str(User) + ".json"
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            slots = json.load(source)
+        return slots if isinstance(slots, list) else []
+    except (OSError, ValueError):
+        return []
+
+def RegisteredUserIDsForSlot(slot):
+    return GetItemNotificationState().registered_user_ids(slot, GetCoreDirectory("reg"))
+
+def IsRegisteredForSlot(User, slot):
+    wanted = str(slot).casefold()
+    return any(str(value).casefold() == wanted for value in RegisteredSlotsFor(str(User)))
+
+def IsKnownItemForSlot(slot, item):
+    try:
+        with open(GetCoreFiles("archconnectiondump"), "r", encoding="utf-8") as source:
+            connection = json.load(source)
+        with open(GetCoreFiles("archgamedump"), "r", encoding="utf-8") as source:
+            games = json.load(source)
+        slot_id = next((key for key, value in connection.get("slot_info", {}).items()
+                        if str(value.get("name", "")).casefold() == str(slot).casefold()), None)
+        if slot_id is None:
+            return False
+        game = connection["slot_info"][slot_id].get("game")
+        names = games.get(game, {}).get("item_name_to_id", {})
+        return any(str(name).casefold() == str(item).casefold() for name in names)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+def UpdateItemNotificationMode(User, mode):
+    state = GetItemNotificationState()
+    user_id = getattr(User, "id", None)
+    if RegisteredSlotsFor(str(User)):
+        BindItemNotificationRegistration(User)
+    result = state.set_mode(user_id, mode)
+    return "Item notifications set to {}.".format(mode) if result else "Could not save notification preferences."
+
+def BindItemNotificationRegistration(User):
+    registration_slots = None
+    try:
+        with open(GetCoreDirectory("reg") + str(User) + ".json", "r", encoding="utf-8") as source:
+            value = json.load(source)
+        if isinstance(value, list) and all(isinstance(slot, str) for slot in value):
+            registration_slots = value
+    except (OSError, ValueError, TypeError):
+        pass
+    return GetItemNotificationState().bind_registration(getattr(User, "id", None), str(User), registration_slots)
+
+def ForgetItemPreferences(User):
+    return GetItemNotificationState().unregister(getattr(User, "id", None))
+
+def UpdateItemWatch(User, slot, item, remove=False):
+    if not IsRegisteredForSlot(User, slot):
+        return "You can only watch items for a slot you're registered for."
+    state = GetItemNotificationState()
+    user_id = getattr(User, "id", None)
+    BindItemNotificationRegistration(User)
+    ok = state.remove_watch(user_id, slot, item) if remove else state.add_watch(user_id, slot, item)
+    if not ok:
+        return "Could not save your watch."
+    if remove:
+        return "Stopped watching {} for {}.".format(item, slot)
+    return "Watching {} for {}. Item pings require `/notify all` or `/notify watched` consent.".format(item, slot)
+
+def ListItemWatches(User):
+    state = GetItemNotificationState()
+    watches = state.watches(getattr(User, "id", None))
+    mode = state.mode(getattr(User, "id", None))
+    if not watches:
+        return "You are not watching any items. Notification mode: {}.".format(mode)
+    message = "**Watched items** (notification mode: {})\n".format(mode) + "\n".join("{} | {}".format(value["slot"], value["item"]) for value in watches)
+    return message if len(message) <= 1900 else message[:1880] + "\n… more watches omitted."
+
+def CanRequestHint(author, slot):
+    # A hint spends the slot's own hint points, so only people registered to
+    # that slot (or bot admins) may ask for one.
+    if IsBotAdmin(author):
+        return True
+    RegistrationFile = GetCoreDirectory("reg") + str(author) + ".json"
+    try:
+        with open(RegistrationFile, "r") as RegistrationInput:
+            RegisteredSlots = json.load(RegistrationInput)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(RegisteredSlots, list):
+        return False
+    WantedSlot = str(slot).strip().lower()
+    return any(str(RegisteredSlot).strip().lower() == WantedSlot for RegisteredSlot in RegisteredSlots)
 
 @discord_client.event
 async def on_message(message):
@@ -558,17 +1034,29 @@ async def on_message(message):
     
     if message.channel.id != MainChannel.id:
         return
+
+    if message.content.lstrip().startswith('$') and not PrefixCommandsEnabled():
+        return
     
     # Registers user for a alot in Archipelago
-    if message.content.startswith('$register'):
-        ArchSlot = message.content
-        ArchSlot = ArchSlot.replace("$register ","")
-        Status = await Command_Register(str(message.author),ArchSlot)
-        await SendMainChannelMessage(Status)
+    RegisterParts = message.content.split(None, 1)
+    if RegisterParts and RegisterParts[0] == '$register':
+        ArchSlot = RegisterParts[1].strip() if len(RegisterParts) > 1 else ""
+        if ArchSlot == "":
+            await SendMainChannelMessage("Use `$register <slot>` with the exact slot name from Archipelago.")
+        else:
+            Status = await Command_Register(str(message.author),ArchSlot)
+            if Status.startswith("You've been registered") or Status.startswith("You're already registered"):
+                BindItemNotificationRegistration(message.author)
+            await SendMainChannelMessage(Status)
 
     # Clears registration file for user
     if message.content.startswith('$clearreg'):
         Status = await Command_ClearReg(str(message.author))
+        if not ForgetItemPreferences(message.author):
+            Status = str(Status) + " Item notification preferences could not be cleared; try again."
+        elif Status == "You're not registered for any slots :(":
+            Status = "You're not registered for slots; item preferences were cleared."
         await SendMainChannelMessage(Status)
 
     if message.content.startswith('$listreg'):
@@ -584,18 +1072,56 @@ async def on_message(message):
     ## Yoinks the specified ItemQueue file, scans through it, then sends the contents to the user
     ## Does NOT delete the file, as it's assumed the other users will want to read the file as well
     if message.content.startswith('$groupcheck'):
-        game = (message.content).split('$groupcheck ')
-        await Command_GroupCheck(message.author, game[1])
+        game = message.content[len('$groupcheck'):].strip()
+        if game == "":
+            await SendMainChannelMessage("Use `$groupcheck <slot>` to see the queued items for a slot.")
+        else:
+            await Command_GroupCheck(message.author, game)
     
     if message.content.startswith('$hints'):
         await Command_Hints(message.author)
-    
-    if message.content.startswith('$hint'):
-        hintrequest = [item.strip() for item in ((message.content).split('$hint '))[1].split('|')]
-        if(len(hintrequest)==2):
-            hint_queue.put(hintrequest)
+
+    NotifyParts = message.content.split(None, 1)
+    if NotifyParts and NotifyParts[0] == '$notify':
+        mode = NotifyParts[1].strip().lower() if len(NotifyParts) > 1 else ''
+        if mode not in ('off', 'all', 'watched'):
+            await SendMainChannelMessage("Use `$notify off`, `$notify all`, or `$notify watched`.")
+        elif mode != 'off' and not RegisteredSlotsFor(str(message.author)):
+            await SendMainChannelMessage("Register for a slot before changing notification settings.")
+        elif mode != 'off' and not ItemNotificationsEnabled():
+            await SendMainChannelMessage("Item notification pings are disabled by the bot administrator.")
         else:
+            await SendMainChannelMessage(UpdateItemNotificationMode(message.author, mode))
+
+    for command_name, remove in (('$watch', False), ('$unwatch', True)):
+        if NotifyParts and NotifyParts[0] == command_name:
+            fields = [value.strip() for value in (NotifyParts[1] if len(NotifyParts) > 1 else '').split('|', 1)]
+            if len(fields) != 2 or not all(fields):
+                await SendMainChannelMessage("Use `{}` <slot> | <item>.".format(command_name))
+            elif not IsRegisteredForSlot(message.author, fields[0]):
+                await SendMainChannelMessage(HINT_NOT_REGISTERED_MESSAGE)
+            elif not IsKnownItemForSlot(fields[0], fields[1]):
+                await SendMainChannelMessage("Use the exact item name for that slot.")
+            else:
+                await SendMainChannelMessage(UpdateItemWatch(message.author, fields[0], fields[1], remove))
+
+    if NotifyParts and NotifyParts[0] == '$watches':
+        await SendMainChannelMessage(ListItemWatches(message.author))
+    
+    HintParts = message.content.split(None, 1)
+    if HintParts and HintParts[0] == '$hint':
+        hintrequest = [item.strip() for item in (HintParts[1] if len(HintParts) > 1 else "").split('|', 1)]
+        if not(len(hintrequest)==2 and all(hintrequest)):
             await SendMainChannelMessage("Invalid $hint format. Use `$hint <slot>|<item>`")
+        elif any(len(field) > HINT_FIELD_MAX_LENGTH for field in hintrequest):
+            await SendMainChannelMessage("Slot and item must each be {} characters or fewer.".format(HINT_FIELD_MAX_LENGTH))
+        elif not CanRequestHint(message.author, hintrequest[0]):
+            await SendMainChannelMessage(HINT_NOT_REGISTERED_MESSAGE)
+        else:
+            if IsRegisteredForSlot(message.author, hintrequest[0]) and IsKnownItemForSlot(hintrequest[0], hintrequest[1]):
+                UpdateItemWatch(message.author, hintrequest[0], hintrequest[1])
+            hint_queue.put(hintrequest)
+            await SendMainChannelMessage(str(message.author) + " requested a hint for " + hintrequest[0] + ": " + hintrequest[1])
 
     if message.content.startswith('$deathcount'):
         await Command_DeathCount()
@@ -606,6 +1132,10 @@ async def on_message(message):
     if message.content.startswith('$checkgraph'):
         await Command_CheckGraph()
     
+    # Local patch: list the player commands.
+    if message.content.startswith('$help'):
+        await SendMainChannelMessage(HelpText)
+
     if message.content.startswith('$iloveyou'):
         await Command_ILoveYou(message)
 
@@ -613,18 +1143,35 @@ async def on_message(message):
         await Command_Hello(message)
     
     if message.content.startswith('$archinfo'):
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
         await Command_ArchInfo(message)
 
     if message.content.startswith('$setconfig'):
-        pair = ((message.content).split('$setconfig '))[1].split(' ')
-        rtrnmessage = SetConfigVariable(pair[0], pair[1])
-        await SendMainChannelMessage(rtrnmessage)
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
+        settings = message.content[len('$setconfig'):].strip()
+        key, separator, value = settings.partition(' ')
+        value = value.strip()
+        if separator == "" or key == "" or value == "":
+            await SendMainChannelMessage("Invalid $setconfig format. Use `$setconfig <key> <value>`")
+        else:
+            rtrnmessage = SetConfigVariable(key, value)
+            await SendMainChannelMessage(rtrnmessage)
 
     if message.content.startswith('$reloadtracker'):
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
         ReloadBot()
         await SendMainChannelMessage("Reloading tracker... Please wait about 5-10 seconds.")
     
     if message.content.startswith('$reloaddiscord'):
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
         discordseppuku_queue.put("Reloading Discord bot...")
         await SendMainChannelMessage("Reloading Discord bot... Please wait.")
 
@@ -657,6 +1204,39 @@ async def CheckCommandQueue():
         print("++ Closing Discord Client")
         exit()
 
+# Alert only after a sustained Archipelago status check outage.
+CheckArchHostFailureCount = 0
+CheckArchHostAlertSent = False
+
+def AlertMention():
+    AlertUserID = str(CoreConfig["DiscordConfig"].get("DiscordAlertUserID", "")).strip()
+    if AlertUserID == "":
+        return ""
+    if AlertUserID.startswith("&"):
+        if AlertUserID[1:].isdigit():
+            return " <@&" + AlertUserID[1:] + ">"
+    elif AlertUserID.isdigit():
+        return " <@" + AlertUserID + ">"
+    WriteToErrorLog("AlertMention", "DiscordAlertUserID must be a numeric user ID or '&role-id': " + AlertUserID)
+    return ""
+
+async def RecordCheckArchHostFailure(Error):
+    global CheckArchHostFailureCount, CheckArchHostAlertSent
+    CheckArchHostFailureCount += 1
+    if CheckArchHostFailureCount >= 5 and not CheckArchHostAlertSent:
+        LastError = str(Error).replace("\n", " ")[:200]
+        await DebugChannel.send("ERROR IN CHECKARCHHOST: couldn't reach archipelago.gg for " + str(CheckArchHostFailureCount) + " checks in a row. Last error: " + LastError + AlertMention())
+        CheckArchHostAlertSent = True
+
+async def ResetCheckArchHostFailures():
+    global CheckArchHostFailureCount, CheckArchHostAlertSent
+    if CheckArchHostAlertSent:
+        await DebugChannel.send("CheckArchHost recovered after " + str(CheckArchHostFailureCount) + " failed checks.")
+    CheckArchHostFailureCount = 0
+    CheckArchHostAlertSent = False
+
+
+
 @tasks.loop(seconds=60)
 async def CheckArchHost():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -666,31 +1246,44 @@ async def CheckArchHost():
             ArchRoomID = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")
             ArchAPIUEL = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/room/")
             RoomAPI = ArchAPIUEL[0]+"/api/room_status/"+ArchRoomID[4]
-            RoomPage = requests.get(RoomAPI)
+            RoomPage = await asyncio.to_thread(requests.get, RoomAPI, timeout=10)
+            RoomPage.raise_for_status()
             RoomData = json.loads(RoomPage.content)
+            raw_last_port = RoomData["last_port"]
+            if isinstance(raw_last_port, bool) or (isinstance(raw_last_port, float) and not raw_last_port.is_integer()):
+                raise ValueError("last_port must be an integer")
+            last_port = int(raw_last_port)
+            if not 1 <= last_port <= 65535:
+                raise ValueError("last_port must be between 1 and 65535")
+            await ResetCheckArchHostFailures()
 
-            cond = str(RoomData["last_port"])
-            if(int(cond) == CoreConfig["ArchipelagoConfig"]['ArchipelagoPort']):
+            if last_port == int(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort']):
                 return
             else:
                 print("Port Check Failed")
-                print(RoomData["last_port"])
+                print(last_port)
                 print(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'])
-                message = "Port Check Failed.  New port is " + str(RoomData["last_port"]) + "."
+                message = "Port Check Failed.  New port is " + str(last_port) + "."
                 #await MainChannel.send(message)
                 await DebugChannel.send(message)
-                SetConfigVariable("ArchipelagoPort", int(RoomData["last_port"]))
+                # Local patch: tell players where the room moved.
+                SetConfigVariable("ArchipelagoPort", last_port)
+                RoomHost = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")[2]
+                if MainChannel is not None:
+                    await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(last_port) + "**")
         
         # We catch both TypeError and JSONDecodeError becuase they are what are thrown when the Arch server is unresponsive.
         # We don't REALLY mind these, as it's a byproduct of the server being offline and we're unable to fetch it properly.
         # The bot will only scream when there is an unhandled error that we have to look into, as is the case with the other processes.
         except TypeError as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: [TypeError] " + str(e))
-        except json.JSONDecodeError as e:
+            await RecordCheckArchHostFailure(e)
+        except (json.JSONDecodeError, ValueError) as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: [JSONDecodingError] " + str(e))
+            await RecordCheckArchHostFailure(e)
         except Exception as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: " + str(e))
-            await DebugChannel.send("ERROR IN CHECKARCHHOST <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+            await RecordCheckArchHostFailure(e)
 
 @tasks.loop(seconds=float(OverClockValue))
 async def ProcessItemQueue():
@@ -741,15 +1334,21 @@ async def ProcessItemQueue():
                 o.close()
 
                 if int(itemclass) == 4 and CoreConfig["ItemFilterConfig"]["BotItemSpoilTraps"] == True:
-                    ItemQueueFile = GetCoreDirectory("item") + recipient.lower() + ".csv"
-                    i = open(ItemQueueFile, "a")
-                    i.write(ItemCheckLogMessage)
-                    i.close()
+                    ItemQueueFile = ItemQueueFileFor(recipient)
+                    if ItemQueueFile is None:
+                        WriteToErrorLog("ItemQueue", "Refusing invalid item queue slot name: " + str(recipient))
+                    else:
+                        i = open(ItemQueueFile, "a")
+                        i.write(ItemCheckLogMessage)
+                        i.close()
                 elif int(itemclass) != 4:
-                    ItemQueueFile = GetCoreDirectory("item") + recipient.lower() + ".csv"
-                    i = open(ItemQueueFile, "a")
-                    i.write(ItemCheckLogMessage)
-                    i.close()
+                    ItemQueueFile = ItemQueueFileFor(recipient)
+                    if ItemQueueFile is None:
+                        WriteToErrorLog("ItemQueue", "Refusing invalid item queue slot name: " + str(recipient))
+                    else:
+                        i = open(ItemQueueFile, "a")
+                        i.write(ItemCheckLogMessage)
+                        i.close()
             else:
                 message = "Unknown Item Send :("
                 print(message)
@@ -759,12 +1358,14 @@ async def ProcessItemQueue():
 
             # If this item is for a player who's snoozed, we skip sending the message entirely
             if CheckSnoozeStatus(recipient):
+                RecordFilteredItemArrival(recipient, item, itemmessage)
                 await CancelProcess()
             elif int(itemclass) == 4 and CoreConfig["ItemFilterConfig"]["BotItemSpoilTraps"] == True:
-                await SendMainChannelMessage(message)
+                await SendItemBroadcast(message, recipient, item, itemmessage)
             elif int(itemclass) != 4 and ItemFilter(int(itemclass),CoreConfig["ItemFilterConfig"]["BotItemFilterLevel"]):
-                await SendMainChannelMessage(message)
+                await SendItemBroadcast(message, recipient, item, itemmessage)
             else:
+                RecordFilteredItemArrival(recipient, item, itemmessage)
                 #In Theory, this should only be called when the two above conditions are not met
                 #So we call this dummy function to escape the async call.
                 await CancelProcess()
@@ -800,6 +1401,79 @@ async def ProcessDeathQueue():
         else:
             return
 
+def _hint_lookup(lookup, *args, fallback):
+    try:
+        result = lookup(*args)
+        return result if result not in (None, "", "NULL") else fallback
+    except Exception:
+        return fallback
+
+async def SendHintResult(hint):
+    receiver = str(hint.get("receiving_player", "?"))
+    finder = str(hint.get("finding_player", "?"))
+    receiver_game = str(_hint_lookup(LookupGame, receiver, fallback="Unknown game"))
+    finder_game = str(_hint_lookup(LookupGame, finder, fallback="Unknown game"))
+    receiver_name = str(_hint_lookup(LookupSlot, receiver, fallback="Player " + receiver))
+    finder_name = str(_hint_lookup(LookupSlot, finder, fallback="Player " + finder))
+    item = str(_hint_lookup(LookupItem, receiver_game, str(hint.get("item", "?")), fallback="Item #" + str(hint.get("item", "?"))))
+    location = str(_hint_lookup(LookupLocation, finder_game, str(hint.get("location", "?")), fallback="Location #" + str(hint.get("location", "?"))))
+    status = format_hint_status(hint.get("status"), hint.get("found", False))
+    entrance = hint.get("entrance")
+    entrance_text = " Entrance: " + str(entrance) if entrance else ""
+    fallback = "Hint result: {receiver}'s {item} is at {finder}'s World at {location}. Status: {status}.{entrance}"
+    notification_config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(notification_config, "get", None)):
+        notification_config = {}
+    message = render_hint_message(notification_config.get("HintMessage"), fallback, {
+        "receiver": receiver_name, "item": item, "location": location,
+        "finder": finder_name, "status": status, "entrance": entrance_text,
+    })
+    await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
+
+def ReportHintRelayDeliveryIssue(summary):
+    """Log one short, payload-free hint delivery summary."""
+    try:
+        WriteToErrorLog("HintRelay", str(summary))
+    except Exception:
+        pass
+
+async def InitializeHintRelayState():
+    """Load durable hint relay state once, including pending deliveries."""
+    global HintRelayStateInstance
+    if HintRelayStateInstance is None:
+        state = HintRelayState(GetCoreFiles("hintrelay"))
+        HintRelayStateInstance = state
+        if state.corrupt:
+            # Logged once per process, when the state is first loaded.
+            if state.corrupt_backup is not None:
+                Notice = "Hint relay state was unreadable and was moved to " + state.corrupt_backup + "; the next store snapshots will be silently baselined."
+            else:
+                Notice = "Hint relay state was unreadable and could not be moved aside (" + str(state.corrupt_error) + "); saving stays blocked until it can be."
+            print("-- " + Notice)
+            WriteToErrorLog("HintRelay", Notice)
+    return HintRelayStateInstance
+
+async def DeliverPendingHintResults():
+    """Send due pending hint results with per-item isolation."""
+    state = HintRelayStateInstance
+    if state is None:
+        return 0
+    return await deliver_pending_hints(state, SendHintResult, log=ReportHintRelayDeliveryIssue)
+
+async def HandleHintRelayMessage(message):
+    try:
+        state = await InitializeHintRelayState()
+        message_type = message.get("type") if isinstance(message, dict) else None
+        if message_type == "HINT_SNAPSHOT":
+            data = message.get("data", {})
+            if isinstance(data, dict):
+                state.observe_snapshot(data.get("key", ""), data.get("hints", []))
+        elif message_type == "HINT_REQUESTED":
+            state.enqueue_requested(message.get("data", {}))
+    except Exception as e:
+        ReportHintRelayDeliveryIssue("hint relay state update failed: " + type(e).__name__)
+    await DeliverPendingHintResults()
+
 @tasks.loop(seconds=float(OverClockValue))
 async def ProcessChatQueue():
     # Messages are passed to the chat queue in the following format:
@@ -823,12 +1497,28 @@ async def ProcessChatQueue():
     # MessageObject = {"type": "CORE", "data": args, "flag": "None"}
     
     try:
+        if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+            try:
+                await InitializeHintRelayState()
+                await DeliverPendingHintResults()
+            except Exception as e:
+                # Hint delivery is best effort and must never starve chat.
+                ReportHintRelayDeliveryIssue("hint relay delivery pass failed: " + type(e).__name__)
         if chat_queue.empty():
             return
         else:
             Message = chat_queue.get()
-            if Message['type'] == "CORE":
-                await SendMainChannelMessage(Message['data']['text'])
+            if Message['type'] in ("HINT_SNAPSHOT", "HINT_REQUESTED"):
+                try:
+                    await HandleHintRelayMessage(Message)
+                except Exception as e:
+                    # Never leak a full hint snapshot into the error log.
+                    ReportHintRelayDeliveryIssue("hint relay message failed: " + type(e).__name__)
+            elif Message['type'] == "CORE":
+                if Message.get('flag') in ("ROOM_SLEEP", "ROOM_WAKE"):
+                    await SendRoomConnectionNotice(Message)
+                else:
+                    await SendMainChannelMessage(Message['data']['text'])
             elif Message['type'] == "HTMessage":
                 if Message['flag'] == "ERROR":
                     await SendMainChannelMessage(Message['data']['text'])
@@ -929,66 +1619,107 @@ async def ProcessChatQueue():
         print("ChatQueue - Error occurred while processing chat queue: " , str(e))
         await SendDebugChannelMessage("Error In Chat Queue Process")
 
-@tree.command(name="register",
-    description="Registers you for AP slot",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction,slot:str):
-    Status = await Command_Register(str(interaction.user),slot)    
-    await interaction.response.send_message(content=Status,ephemeral=True)
-
-@tree.command(name="clearreg",
-    description="Clears your registration file",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    Status = await Command_ClearReg(str(interaction.user))
-    await interaction.response.send_message(content=Status,ephemeral=True)
-    
-@tree.command(name="ketchmeup",
-    description="Ketches the user up with missed items",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction,filter:str):
-    await interaction.user.create_dm()
-    UserDM = interaction.user
-    await Command_KetchMeUp(UserDM, interaction.message.content)
-    await interaction.response.send_message(content="Sending your missed items... Please Hold.",ephemeral=True)
-
-@tree.command(name="groupcheck",
-    description="Ketches the user up with group game missed items",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction, groupslot:str):
-    await Command_GroupCheck(interaction.user, groupslot)
-    await interaction.response.send_message(content="Sending group missed items... Please Hold.",ephemeral=True)
-
-@tree.command(name="deathcount",
-    description="Posts a deathcount chart and graph",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    await Command_DeathCount()
-    await interaction.response.send_message(content="Deathcount")
-
-@tree.command(name="checkcount",
-    description="Posts a check chart",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    await Command_CheckCount()
-    await interaction.response.send_message(content="Checkcount:")
-
-@tree.command(name="checkgraph",
-    description="Posts a check graph",
-    guild=discord.Object(id=DiscordGuildID)
-)
-async def first_command(interaction):
-    await Command_CheckGraph()
-    await interaction.response.send_message(content="Checkgraph:")
-
 async def SendMainChannelMessage(message):
-    await MainChannel.send(message)
+    # Relayed Archipelago chat must never be able to ping @everyone or roles.
+    await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
+
+async def SendItemBroadcast(message, slot, item, event):
+    """Post the existing item broadcast with only explicitly opted-in mentions."""
+    registered_ids = RegisteredUserIDsForSlot(slot)
+    event_key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    state = GetItemNotificationState()
+    recipients = [] if state.was_delivered(event_key) else state.recipients(slot, item, registered_ids)
+    users = [discord.Object(id=user_id) for user_id in recipients]
+    if not ItemNotificationsEnabled():
+        users = []
+    # Keep the normal case to one post: original item text plus all mentions
+    # that fit under Discord's content and allowed-user limits.
+    base = str(message)
+    first_users, remaining = [], []
+    first_text = base
+    for user in users:
+        mention = "<@{}>".format(user.id)
+        appended = " " + mention
+        if len(first_users) < 100 and len(first_text) + len(appended) <= 2000:
+            first_users.append(user)
+            first_text += appended
+        else:
+            remaining.append((user, mention))
+    # Extremely long legacy text is chunked; actual item broadcasts fit one post.
+    base_chunks = [first_text[i:i + 2000] for i in range(0, len(first_text), 2000)] or [""]
+    await MainChannel.send(
+        base_chunks[0],
+        allowed_mentions=discord.AllowedMentions(users=first_users, roles=False, everyone=False, replied_user=False),
+    )
+    for chunk in base_chunks[1:]:
+        await MainChannel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    # Overflow is exceptional. Keep each follow-up contextual and within both
+    # Discord limits; the base post has already succeeded if an overflow send fails.
+    overflow = []
+    context = "More opted-in players for {} / {}: ".format(slot, item)
+    current, current_length = [], len(context)
+    for user, mention in remaining:
+        added = len(mention) + (1 if current else 0)
+        if current and (len(current) >= 100 or current_length + added > 2000):
+            overflow.append(current)
+            current, current_length, added = [], len(context), len(mention)
+        current.append((user, mention))
+        current_length += added
+    if current:
+        overflow.append(current)
+    for chunk in overflow:
+        content = context + " ".join(mention for _, mention in chunk)
+        await MainChannel.send(content, allowed_mentions=discord.AllowedMentions(users=[user for user, _ in chunk], roles=False, everyone=False, replied_user=False))
+    if not state.was_delivered(event_key):
+        state.complete_delivery(event_key, slot, item, registered_ids)
+
+def RecordFilteredItemArrival(slot, item, event):
+    """Complete matching watches for an item observed but filtered from channel output."""
+    key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    state = GetItemNotificationState()
+    if not state.was_delivered(key):
+        state.complete_delivery(key, slot, item, RegisteredUserIDsForSlot(slot))
+
+DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES = 15
+RoomSleepNoticeMessage = None
+RoomSleepNoticeSentAt = None
+
+def GetSleepWakeEditWindowSeconds():
+    """NotificationConfig.SleepWakeEditWindowMinutes in seconds; 0 always posts a new wake notice."""
+    notification_config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(notification_config, "get", None)):
+        notification_config = {}
+    minutes = notification_config.get("SleepWakeEditWindowMinutes", DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES)
+    try:
+        if isinstance(minutes, bool):
+            raise ValueError("not a number of minutes")
+        minutes = float(minutes)
+    except (TypeError, ValueError):
+        minutes = DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES
+    if not 0 <= minutes < float("inf"):
+        minutes = DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES
+    return minutes * 60
+
+async def SendRoomConnectionNotice(Message):
+    """Post a sleep notice. If the room wakes soon after, edit that notice instead of posting again."""
+    global RoomSleepNoticeMessage, RoomSleepNoticeSentAt
+    text = Message['data']['text']
+    SleepMessage = RoomSleepNoticeMessage
+    SentAt = RoomSleepNoticeSentAt
+    RoomSleepNoticeMessage = None
+    RoomSleepNoticeSentAt = None
+    if Message.get('flag') == "ROOM_SLEEP":
+        RoomSleepNoticeMessage = await MainChannel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        RoomSleepNoticeSentAt = time.monotonic()
+        return
+    if SleepMessage is not None and time.monotonic() - SentAt < GetSleepWakeEditWindowSeconds():
+        try:
+            await SleepMessage.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
+            return
+        except discord.HTTPException as e:
+            # The notice may have been deleted; fall back to a new message.
+            WriteToErrorLog("RoomNotice", "Could not edit the sleep notice, posting instead: " + type(e).__name__)
+    await SendMainChannelMessage(text)
 
 async def SendDebugChannelMessage(message):
     await DebugChannel.send(message)
@@ -996,8 +1727,70 @@ async def SendDebugChannelMessage(message):
 async def SendDMMessage(message,user):
     await MainChannel.send(message)
 
-async def Command_Register(Sender:str, ArchSlot:str):
+def CatchupStartFileFor(Sender):
+    # Registration files are keyed by the Discord name, so the start marks are too.
+    SafeName = "".join(char if char.isalnum() or char in "-_." else "_" for char in str(Sender))
+    if SafeName in ("", ".", ".."):
+        SafeName = "user"
+    return GetCoreDirectory("reg") + "catchup-start/" + SafeName + ".json"
+
+def MoveCatchupStartAside(StartFile):
+    """Keep an unreadable start-mark file for recovery. Returns False if it could not be moved."""
     try:
+        os.replace(StartFile, unused_corrupt_path(StartFile))
+        return True
+    except OSError as e:
+        WriteToErrorLog("CatchupStart", "Could not move unreadable catch-up start marks aside: " + str(e))
+        return False
+
+def LoadCatchupStart(Sender):
+    """Return the start marks, or None when the file exists but cannot be read."""
+    StartFile = CatchupStartFileFor(Sender)
+    try:
+        if not os.path.isfile(StartFile):
+            return {}
+        with open(StartFile, "r") as StartInput:
+            Loaded = json.load(StartInput)
+        if not isinstance(Loaded, dict):
+            raise ValueError("catch-up start marks are not an object")
+        return {str(Slot).strip().lower(): max(0, int(Count)) for Slot, Count in Loaded.items()}
+    except Exception as e:
+        WriteToErrorLog("CatchupStart", "Could not read catch-up start marks: " + str(e))
+        # The other slots' marks are still in this file, so move it aside rather than let a write replace it.
+        MoveCatchupStartAside(StartFile)
+        return None
+
+def RecordCatchupStart(Sender, ArchSlot):
+    """Start a new registrant at the current end of the slot queue, not its full history."""
+    try:
+        ItemQueueFile = ItemQueueFileFor(ArchSlot)
+        QueueLength = 0
+        if ItemQueueFile is not None and os.path.isfile(ItemQueueFile):
+            with open(ItemQueueFile, "r") as QueueInput:
+                QueueLength = len(QueueInput.readlines())
+        StartFile = CatchupStartFileFor(Sender)
+        StartMarks = LoadCatchupStart(Sender)
+        if StartMarks is None:
+            if os.path.isfile(StartFile):
+                # The unreadable file is still in place, so writing would erase the other slots' marks.
+                WriteToErrorLog("CatchupStart", "Skipped recording catch-up start mark; unreadable marks left in place.")
+                return
+            StartMarks = {}
+        StartMarks[str(ArchSlot).strip().lower()] = QueueLength
+        os.makedirs(os.path.dirname(StartFile), exist_ok=True)
+        TemporaryFile = StartFile + ".tmp"
+        with open(TemporaryFile, "w") as StartOutput:
+            json.dump(StartMarks, StartOutput, indent=4)
+        os.replace(TemporaryFile, StartFile)
+    except Exception as e:
+        WriteToErrorLog("CatchupStart", "Could not record catch-up start mark: " + str(e))
+
+async def Command_Register(Sender:str, ArchSlot:str):
+    ArchSlot = str(ArchSlot).strip()
+    try:
+        if ItemQueueFileFor(ArchSlot) is None:
+            return "That slot name is invalid. Use the exact slot name from Archipelago."
+
         #Compile the Registration File's path
         RegistrationFile = GetCoreDirectory("reg") + Sender + ".json"
 
@@ -1015,13 +1808,14 @@ async def Command_Register(Sender:str, ArchSlot:str):
 
             RegistrationContents.append(ArchSlot)
             json.dump(RegistrationContents, open(RegistrationFile, "w"), indent=4)
+            RecordCatchupStart(Sender, ArchSlot)
             return "You've been registered for " + ArchSlot + "!"
         else:
             return "You're already registered for that slot."
     except Exception as e:
         WriteToErrorLog("Command_Register", "Error in register command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN REGISTER <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN REGISTER"+AlertMention())
         return "Critical error in REGISTER :("
 
 async def Command_ListRegistrations(Sender):
@@ -1045,10 +1839,12 @@ async def Command_ListRegistrations(Sender):
     except discord.Forbidden as e:
         WriteToErrorLog("Command_ListRegistrations", "Can not send a DM to "+ str(Sender) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_ListRegistrations", "Error in list registrations command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN LISTREG <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN LISTREG"+AlertMention())
+        return False
 
 async def Command_ClearReg(Sender:str):
     try:
@@ -1060,9 +1856,28 @@ async def Command_ClearReg(Sender:str):
     except Exception as e:
         WriteToErrorLog("Command_ClearReg", "Error in clear registration command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN CLEARREG <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN CLEARREG"+AlertMention())
+
+def CatchupUserKey(User):
+    # One durable cursor per Discord user, keyed by user ID when it is known.
+    UserID = getattr(User, "id", None)
+    if UserID is None:
+        UserKey = "".join(char if char.isalnum() or char in "-_." else "_" for char in str(User))
+    else:
+        UserKey = str(UserID)
+    if UserKey in ("", ".", ".."):
+        UserKey = "user"
+    return UserKey
+
+# One lock per user, keyed like the cursor file. Without it, two quick
+# $ketchmeup calls read the same cursor and DM the same items twice.
+CatchupLocks = {}
 
 async def Command_KetchMeUp(User, message_filter):
+    async with CatchupLocks.setdefault(CatchupUserKey(User), asyncio.Lock()):
+        return await KetchMeUpLocked(User, message_filter)
+
+async def KetchMeUpLocked(User, message_filter):
     try:
         message_filter = message_filter.replace("$ketchmeup","")
         message_filter = message_filter.replace("/ketchmeup","")
@@ -1079,73 +1894,119 @@ async def Command_KetchMeUp(User, message_filter):
         if not os.path.isfile(RegistrationFile):
             await User.send("You've not registered for a slot : (")
         else:
+            # Catching up never removes the shared queue from other players registered to the same slot.
+            UserKey = CatchupUserKey(User)
+
+            CursorDirectory = GetCoreDirectory("reg") + "catchup/"
+            CursorFile = CursorDirectory + UserKey + ".json"
+            Cursor = {}
+            try:
+                if os.path.isfile(CursorFile):
+                    LoadedCursor = json.load(open(CursorFile, "r"))
+                    if isinstance(LoadedCursor, dict):
+                        for StoredSlot, Delivered in LoadedCursor.items():
+                            try:
+                                Cursor[str(StoredSlot).strip().lower()] = max(0, int(Delivered))
+                            except (TypeError, ValueError):
+                                continue
+            except Exception as e:
+                WriteToErrorLog("Command_KetchMeUp", "Could not read catch-up cursor: " + str(e))
+                Cursor = {}
+
+            try:
+                os.makedirs(CursorDirectory, exist_ok=True)
+            except OSError as e:
+                WriteToErrorLog("Command_KetchMeUp", "Could not create catch-up cursor directory: " + str(e))
+
+            def SaveCursor():
+                TemporaryFile = CursorFile + ".tmp"
+                try:
+                    with open(TemporaryFile, "w") as CursorOutput:
+                        json.dump(Cursor, CursorOutput, indent=4)
+                    os.replace(TemporaryFile, CursorFile)
+                finally:
+                    if os.path.exists(TemporaryFile):
+                        os.remove(TemporaryFile)
+
+            CatchupStart = LoadCatchupStart(User) or {}
             RegistrationContents = json.load(open(RegistrationFile, "r"))
             for reglines in RegistrationContents:
-                ItemQueueFile = GetCoreDirectory("item") + (reglines.lower()).strip() + ".csv"
+                SlotName = str(reglines).strip()
+                ItemQueueFile = ItemQueueFileFor(SlotName)
+                if ItemQueueFile is None:
+                    await User.send("Skipping invalid slot name: " + SlotName)
+                    continue
                 if not os.path.isfile(ItemQueueFile):
-                    await User.send("There are no items for " + reglines.strip() + " :/")
+                    await User.send("There are no items for " + SlotName + " :/")
                     continue
                 k = open(ItemQueueFile, "r")
                 ItemQueueLines = k.readlines()
                 k.close()
-                os.remove(ItemQueueFile)
-        
-                YouWidth = 0
-                ItemWidth = 0
-                SenderWidth = 0
-                YouArray = [0]
-                ItemArray = [0]
-                SenderArray = [0]
-        
-                for line in ItemQueueLines:
-                    YouArray.append(len(line.split("||")[0]))
-                    ItemArray.append(len(line.split("||")[1]))
-                    SenderArray.append(len(line.split("||")[2]))
-                
-                YouArray.sort(reverse=True)
-                ItemArray.sort(reverse=True)
-                SenderArray.sort(reverse=True)
-        
-                YouWidth = YouArray[0]
-                ItemWidth = ItemArray[0]
-                SenderWidth = SenderArray[0]
-        
-                You = "You"
-                Item = "Item"
-                Sender = "Sender"
-                Location = "Location"
-        
-                ketchupmessage = "```" + You.ljust(YouWidth) + " || " + Item.ljust(ItemWidth) + " || " + Sender.ljust(SenderWidth) + " || " + Location + "\n"
-                for line in ItemQueueLines:
-                    You = line.split("||")[0].strip()
-                    Item = line.split("||")[1].strip()
-                    Sender = line.split("||")[2].strip()
-                    Location = line.split("||")[3].strip()
-                    Class = line.split("||")[4].strip()
 
-                    if ItemFilter(int(Class),int(message_filter)):
+                CursorKey = SlotName.strip().lower()
+                if CursorKey not in Cursor:
+                    # First catch-up: begin where this user registered.
+                    Cursor[CursorKey] = CatchupStart.get(CursorKey, 0)
+                Delivered = Cursor[CursorKey]
+                if Delivered < 0 or Delivered > len(ItemQueueLines):
+                    Delivered = 0
+
+                YouWidth = len("You")
+                ItemWidth = len("Item")
+                SenderWidth = len("Sender")
+                NewRows = []
+                for line in ItemQueueLines[Delivered:]:
+                    Fields = line.split("||")
+                    if len(Fields) < 5:
+                        continue
+                    try:
+                        ItemClass = int(Fields[4].strip())
+                    except (TypeError, ValueError):
+                        continue
+                    if not ItemFilter(ItemClass, int(message_filter)):
+                        continue
+                    You = Fields[0].strip()
+                    Item = Fields[1].strip()
+                    Sender = Fields[2].strip()
+                    Location = Fields[3].strip()
+                    NewRows.append((You, Item, Sender, Location))
+                    YouWidth = max(YouWidth, len(You))
+                    ItemWidth = max(ItemWidth, len(Item))
+                    SenderWidth = max(SenderWidth, len(Sender))
+
+                if NewRows:
+                    ketchupmessage = "```" + "You".ljust(YouWidth) + " || " + "Item".ljust(ItemWidth) + " || " + "Sender".ljust(SenderWidth) + " || Location\n"
+                    for You, Item, Sender, Location in NewRows:
                         ketchupmessage = ketchupmessage + You.ljust(YouWidth) + " || " + Item.ljust(ItemWidth) + " || " + Sender.ljust(SenderWidth) + " || " + Location + "\n"
 
-                    if len(ketchupmessage) > 1500:
-                        ketchupmessage = ketchupmessage + "```"
+                        if len(ketchupmessage) > 1500:
+                            ketchupmessage = ketchupmessage + "```"
+                            await User.send(ketchupmessage)
+                            ketchupmessage = "```"
+                    ketchupmessage = ketchupmessage + "```"
+                    if not ketchupmessage == "``````":
                         await User.send(ketchupmessage)
-                        ketchupmessage = "```"
-                ketchupmessage = ketchupmessage + "```"
-                if not ketchupmessage == "``````":
-                    await User.send(ketchupmessage)
+
+                # Only advance after every DM for this slot succeeded.
+                Cursor[CursorKey] = len(ItemQueueLines)
+                SaveCursor()
     except discord.Forbidden as e:
         WriteToErrorLog("Command_KetchMeUp", "Can not send a DM to "+ str(User) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_KetchMeUp", "Error in ketch me up command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN KETCHMEUP <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN KETCHMEUP"+AlertMention())
+        return False
 
 async def Command_GroupCheck(DMauthor, game):
     try:
-        ItemQueueFile = GetCoreDirectory("item") + game + ".csv"
-        if not os.path.isfile(ItemQueueFile):
-            await DMauthor.send("There are no items for " + game[1] + " :/")
+        ItemQueueFile = ItemQueueFileFor(game)
+        if ItemQueueFile is None:
+            await DMauthor.send("That slot name is invalid.")
+        elif not os.path.isfile(ItemQueueFile):
+            await DMauthor.send("There are no items for " + game + " :/")
         else:
             k = open(ItemQueueFile, "r")
             ItemQueueLines = k.readlines()
@@ -1164,10 +2025,12 @@ async def Command_GroupCheck(DMauthor, game):
     except discord.Forbidden as e:
         WriteToErrorLog("Command_GroupCheck", "Can not send a DM to "+ str(DMauthor) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_GroupCheck", "Error in group check command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN GROUPCHECK <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN GROUPCHECK"+AlertMention())
+        return False
 
 async def Command_Hints(player):
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1280,12 +2143,15 @@ async def Command_Hints(player):
     except discord.Forbidden as e:
         WriteToErrorLog("Command_Hints", "Can not send a DM to "+ str(player) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_Hints", "Error in hints command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN HINTLIST <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN HINTLIST"+AlertMention())
+        return False
 
 async def Command_DeathCount():
+    fig = None
     try:
         d = open(GetCoreFiles("deathlog"),"r")
         DeathLines = d.readlines()
@@ -1294,7 +2160,7 @@ async def Command_DeathCount():
 
         if len(DeathLines) == 0:
             await MainChannel.send("No deaths to report.")
-            return
+            return True
         
         for deathline in DeathLines:
             DeathUser = deathline.split("||")[6]
@@ -1359,9 +2225,14 @@ async def Command_DeathCount():
         # Save image and send - any existing plot will be overwritten
         plt.savefig(GetCoreFiles("deathplot"), bbox_inches="tight")
         await MainChannel.send(file=discord.File(GetCoreFiles("deathplot")))
+        return True
     except Exception as e:
         WriteToErrorLog("Command_DeathCount", "Error in death count command: " + str(e))
-        await DebugChannel.send("ERROR DEATHCOUNT <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR DEATHCOUNT"+AlertMention())
+        return False
+    finally:
+        if fig is not None:
+            plt.close(fig)
 
 async def Command_CheckCount():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1369,7 +2240,12 @@ async def Command_CheckCount():
         return
 
     try:
-        page = requests.get(CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'])
+        page = await asyncio.to_thread(
+            requests.get,
+            CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'],
+            timeout=15,
+        )
+        page.raise_for_status()
         soup = BeautifulSoup(page.content, "html.parser")
 
         #Yoinks table rows from the checks table
@@ -1433,19 +2309,27 @@ async def Command_CheckCount():
         #Finishes the check message
         checkmessage = checkmessage + "```"
         await MainChannel.send(checkmessage)
+        return True
     except Exception as e:
         WriteToErrorLog("Command_CheckCount", "Error in check count command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN CHECKCOUNT <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN CHECKCOUNT"+AlertMention())
+        return False
 
 async def Command_CheckGraph():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
         await MainChannel.send("This command is not available in self-hosted mode.")
         return
 
+    fig = None
     try:
-        page = requests.get(CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'])
-        soup = BeautifulSoup(page.content, "html.parser")
+        response = await asyncio.to_thread(
+            requests.get,
+            CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'],
+            timeout=15,
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.content, "html.parser")
 
         #Yoinks table rows from the checks table
         tables = soup.find("table",id="checks-table")
@@ -1514,10 +2398,70 @@ async def Command_CheckGraph():
         # Save image and send - any existing plot will be overwritten
         plt.savefig(GetCoreFiles("checkplot"), bbox_inches="tight")
         await MainChannel.send(file=discord.File(GetCoreFiles("checkplot")))
+        return True
     except Exception as e:
         WriteToErrorLog("Command_CheckGraph", "Error in check graph command: " + str(e))
         print(e)
-        await DebugChannel.send("ERROR IN CHECKGRAPH <@"+str(CoreConfig["DiscordConfig"]["DiscordAlertUserID"])+">")
+        await DebugChannel.send("ERROR IN CHECKGRAPH"+AlertMention())
+        return False
+    finally:
+        if fig is not None:
+            plt.close(fig)
+
+PLAYER_COMMAND_NAMES = register_player_commands(
+    tree,
+    {
+        "help_text": """**Player slash commands**
+/help — show this list
+/register slot — register for a slot
+/listreg — DM your registrations
+/clearreg — remove your registrations
+/ketchmeup filter — DM missed items (0 all, 1 useful and progression, 2 progression)
+/groupcheck slot — DM queued items for a slot
+/hints — DM assigned hints
+/hint slot item — request a hint for a slot you're registered for
+/notify mode — choose off, all registered slots, or watched items
+/watch slot item — watch an item in a registered slot
+/unwatch slot item — stop watching an item
+/watches — list active item watches
+/checkcount — post check counts
+/checkgraph — post progress graph
+/deathcount — post DeathLink tally""",
+        "register": Command_Register,
+        "listreg": Command_ListRegistrations,
+        "clearreg": Command_ClearReg,
+        "ketchmeup": Command_KetchMeUp,
+        "groupcheck": Command_GroupCheck,
+        "hints": Command_Hints,
+        "hint_queue": lambda: hint_queue,
+        "can_hint": CanRequestHint,
+        "slash_enabled": SlashCommandsEnabled,
+        "global_notifications_enabled": ItemNotificationsEnabled,
+        "is_registered_user": lambda user: bool(RegisteredSlotsFor(str(user))),
+        "is_registered_for_slot": IsRegisteredForSlot,
+        "is_valid_item": IsKnownItemForSlot,
+        "set_notify_mode": UpdateItemNotificationMode,
+        "bind_registration": BindItemNotificationRegistration,
+        "add_watch": lambda user, slot, item: UpdateItemWatch(user, slot, item),
+        "remove_watch": lambda user, slot, item: UpdateItemWatch(user, slot, item, True),
+        "list_watches": ListItemWatches,
+        "clear_preferences": ForgetItemPreferences,
+        "checkcount": Command_CheckCount,
+        "checkgraph": Command_CheckGraph,
+        "deathcount": Command_DeathCount,
+    },
+    lambda: CoreConfig["DiscordConfig"]["DiscordBroadcastChannel"],
+)
+
+async def EnforceSlashCommandToggle(interaction):
+    if SlashCommandsEnabled():
+        return True
+    if not interaction.response.is_done():
+        await interaction.response.send_message("Slash commands are disabled.", ephemeral=True)
+    return False
+
+tree.interaction_check = EnforceSlashCommandToggle
+
 
 async def Command_ILoveYou(message):
     await message.channel.send("Thank you.  You make a difference in this world. :)")
@@ -1525,35 +2469,42 @@ async def Command_ILoveYou(message):
 async def Command_Hello(message):
     await message.channel.send('Hello!')
 
+def RedactConfigValue(key, value):
+    KeyName = str(key).lower()
+    for SecretWord in ("token", "password", "secret"):
+        if SecretWord in KeyName:
+            return "<redacted>"
+    return str(value)
+
 async def Command_ArchInfo(message):
     if(CoreConfig["AdvancedConfig"]["DebugMode"] == True):
         print("== Discord Config")
         for key, value in CoreConfig["DiscordConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== ArchipelagoConfig Config")
         for key, value in CoreConfig["ArchipelagoConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== ItemFilterConfig Config")
         for key, value in CoreConfig["ItemFilterConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== RelayConfig Config")
         for key, value in CoreConfig["RelayConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== DrawbridgeConfig Config")
         for key, value in CoreConfig["DrawbridgeConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== MetaConfig Config")
         for key, value in CoreConfig["MetaConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== AdvancedConfig Config")
         for key, value in CoreConfig["AdvancedConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
     else:
         await message.channel.send("Debug Mode is disabled.")
 
@@ -1799,6 +2750,22 @@ def SetConfigVariable(key, value):
     if key not in ["ArchipelagoPort","ArchipelagoPassword","ArchipelagoTrackerURL","ArchipelagoServerURL","UniqueID"]:
         return "Invalid key. Only 'ArchipelagoPort', 'ArchipelagoPassword', 'ArchipelagoTrackerURL', 'ArchipelagoServerURL', and 'UniqueID' can be set."
     else:
+        if key == "ArchipelagoPort":
+            try:
+                PortValue = int(str(value).strip())
+            except (TypeError, ValueError):
+                return "Invalid ArchipelagoPort. Use a whole number from 1 to 65535."
+            if not 1 <= PortValue <= 65535:
+                return "Invalid ArchipelagoPort. Use a whole number from 1 to 65535."
+            value = PortValue
+        if key == "UniqueID":
+            UniqueIDValue = str(value)
+            if UniqueIDValue in ("", ".", ".."):
+                return "Invalid UniqueID. Use a plain value without path separators or control characters."
+            if any(char in UniqueIDValue for char in ("/", "\\")):
+                return "Invalid UniqueID. Use a plain value without path separators or control characters."
+            if any(ord(char) < 32 or ord(char) == 127 for char in UniqueIDValue):
+                return "Invalid UniqueID. Use a plain value without path separators or control characters."
         with ConfigLock:
             if key == "ArchipelagoPort":
                 CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'] = value
@@ -1817,11 +2784,14 @@ def SetConfigVariable(key, value):
             
             # Convert shared dict to regular dict for JSON serialization
             config_for_json = {k: dict(v) if hasattr(v, 'keys') else v for k, v in CoreConfig.items()}
-            json.dump(config_for_json, open('config.json', "w"), indent=4)
+            with open('config.json', "w") as config_file:
+                json.dump(config_for_json, config_file, indent=4)
 
         #We'll reconfirm and reload the data locations since we can change values.
         ConfirmSpecialFiles()
-        return "Key '" + key + "' set to '" + value + "'!"
+        if key == "ArchipelagoPassword":
+            return "Key 'ArchipelagoPassword' updated."
+        return "Key '" + key + "' set to '" + str(value) + "'!"
 
 def ReloadBot():
     global ToggleConfig

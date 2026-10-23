@@ -65,9 +65,9 @@ You're done with the bot portal for now, but keep that token handy!
   1. Copy `config.json.template` to `config.json`
 - Discord Config
     1. Fill out the `DiscordToken` with your discord app/bot's token
-  1. Fill out `DiscordBroadcastChannel` with the channel ID that you'd like the bot to post AP info in
-    1. Fill out `DiscordAlertUserID` with your User ID. (This can also be a group/role in discord)
-    1. Fill out `DiscordDebugChannel` with the channel ID of the debug channel
+  1. Fill out `DiscordBroadcastChannel` with the channel ID where the bot posts AP info and accepts player commands
+    1. Fill out `DiscordAlertUserID` with your own Discord user ID. The bot mentions that user in debug-channel error alerts. To mention a role instead, enter `&` followed by the role ID; any other value is logged and not mentioned.
+    1. Fill out `DiscordDebugChannel` with the channel ID for admin/debug alerts. Use the same ID as `DiscordBroadcastChannel` to keep commands and all channel notifications together, or choose a separate debug channel. The bot needs permission to view and send messages in each configured channel, and attach files in the broadcast channel for charts.
 - Archipelago Config
   1. Fill out `ArchipelagoServer` if you're self-hosting the Archipelago Server
   1. Fill out `ArchipelagoPort` with the port number you've been assigned
@@ -77,14 +77,33 @@ You're done with the bot portal for now, but keep that token handy!
   1. Fill out `ArchipelagoServerURL` with the room URL
   1. Fill out `UniqueID` with the RoomID/seed/an arbitrary value (see [UniqueID](#UniqueID) for detailed usage)
 - Item Filter Config
+  - See [Item notification filters](item-notifications.md) for flag values and how channel filters differ from DM filters.
   1. Set `BotItemSpoilTraps` to `true` if you'd like to have traps spoiled, or change to `false` to hide traps
-  1. Set `BotItemFilterLevel` to the level you'd like: `0`, `1`, or `2` (See the main [Readme](/README.md) for details on what the filter levels mean)
+  1. Set `BotItemFilterLevel` to the level you'd like: `0`, `1`, or `2` (see the main [Readme](/README.md) for details on what the filter levels mean). Level `2` means progression items only. This value is read from your local `config.json` (ignored by git), not hardcoded in the bot. The generic `config.json.template` keeps the default level `0`.
 - Relay Config
-  1. Set desired AP to Discord relay options.
+  1. Set desired AP to Discord relay options. For hint result notifications,
+     see [Hint result notifications](hint-notifications.md).
 - Drawbridge Config
   1. Set `DiscordBridgeEnabled` to `true` if you'd like chat from discord bridged to AP.
 - Meta Config
   1. Set `FlavorDeathLink` to `true` if you'd like custom flavored deathlink messages.
+- Daily Post Config (optional, disabled by default)
+  1. Set `Enabled` to `true` to post `$checkcount`, `$checkgraph`, and `$deathcount` results to the broadcast channel once a day, in that order.
+  1. Set `Time` to the local 24-hour `HH:MM` time you want the post (default `00:00`).
+  1. Set `Timezone` to an IANA timezone such as `America/New_York` (default `America/New_York`).
+  1. The bot waits for the next configured time after startup rather than posting immediately, and it remembers the last posted local date in `logs/<UniqueID>/DailyPostState.json` so restarts do not repeat a day. If the process is suspended across the scheduled time, the missed post may still be delivered late once after it resumes.
+  1. Each report is attempted once per day. A failed report does not prevent later reports from running. Failures are logged and not retried the same day; the bot tries again at the next day's scheduled time.
+  1. `SelfHostNoWeb` mode disables the check graph, so daily posts need the tracker web page.
+- Command Config (optional)
+  1. `PrefixCommandsEnabled` and `SlashCommandsEnabled` default to `true` and independently enable `$` and `/` commands. Use JSON booleans; missing or malformed values use `true`. Restart after editing.
+  1. Disabling prefix commands includes message-only admin commands. Re-enable them through the config file. Disabling slash commands removes them from the configured server on successful sync and rejects stale interactions.
+  1. Notification relays and scheduled reports continue even with both command interfaces disabled.
+- Notification Config (optional)
+  1. `ItemMentionsEnabled` defaults to `false`. Set it to JSON `true` to allow item pings, then each registered player must explicitly opt in with `/notify` or `$notify`. See [item pings and watches](item-watches.md).
+  1. `ConnectionUnavailableMessage` and `ConnectionRestoredMessage` customize notices sent after a prolonged room disconnect and after recovery. The built-in defaults are plain text.
+  1. Use `{room_url}` for the room URL (the bot supplies `<` and `>` around it to suppress Discord embeds) and `{server_address}` for the plain `host:port` value. Other text, including emoji, is sent as written. Missing, malformed, empty, or non-string values fall back to the built-in messages.
+  1. `SleepWakeEditWindowMinutes` (default `15`): if the room is reachable again within this many minutes of the unavailable notice, the bot edits that notice into the restored message instead of posting a second message. `0` always posts a new message.
+  1. `HintMessage` (see [Hint result notifications](hint-notifications.md)) replaces the complete hint result announcement. Placeholders: `{receiver}`, `{item}`, `{location}`, `{finder}`, `{status}`, `{entrance}`. Result posts never ping anyone and are capped at Discord's 2000-character limit. The built-in fallback is plain text without any emoji; emoji prefixes in the shipped `config.json.template` are examples, not defaults.
 
 You're free to leave the Advanced Config section as-is unless you know what you're doing.  
 Detailed references for the `config.json` can be found on the main [Readme](/README.md)
@@ -133,6 +152,8 @@ This process will automatically create new directories, and reload all data need
 It's a fairly painless process, but should be done carefully and in order, as to not break Bridgeipelago into a thousand pieces.
 
 **(Make sure the room is up, and connectable by clients before you $reloadtracker!)**
+
+These commands require **Administrator** or **Manage Server** permission in the server. Passwords are never echoed back to the channel.
 
 1. `$setconfig ArchipelagoPort <port>`  
     - Sets the port

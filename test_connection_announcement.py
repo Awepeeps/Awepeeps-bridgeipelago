@@ -25,12 +25,13 @@ class FakeTask:
         return self.running
 
 class ConnectionAnnouncementTests(unittest.TestCase):
-    def run_ready_twice(self, announce_setting):
+    def run_ready_twice(self, announce_setting, main_channel=None, sync_side_effect=None):
         on_ready = load_on_ready()
         debug_channel = SimpleNamespace(send=AsyncMock())
-        main_channel = SimpleNamespace(guild=SimpleNamespace(id=123))
+        if main_channel is None:
+            main_channel = SimpleNamespace(guild=SimpleNamespace(id=123))
         client = SimpleNamespace(get_channel=lambda channel_id: {1: main_channel, 2: debug_channel}[channel_id], user="mock bot")
-        tree = SimpleNamespace(copy_global_to=Mock(), sync=AsyncMock())
+        tree = SimpleNamespace(copy_global_to=Mock(), sync=AsyncMock(side_effect=sync_side_effect))
         tasks = [FakeTask() for _ in range(5)]
         discord = SimpleNamespace(Object=lambda id: SimpleNamespace(id=id), HTTPException=Exception)
         discord_config = {"DiscordBroadcastChannel": "1", "DiscordDebugChannel": "2"}
@@ -67,6 +68,62 @@ class ConnectionAnnouncementTests(unittest.TestCase):
         self.assertEqual(tree.sync.await_count, 1)
         for task in tasks:
             task.start.assert_called_once_with()
+
+    def test_missing_broadcast_channel_skips_sync_but_starts_background_tasks(self):
+        on_ready = load_on_ready()
+        debug_channel = SimpleNamespace(send=AsyncMock())
+        client = SimpleNamespace(get_channel=lambda channel_id: None if channel_id == 1 else debug_channel, user="mock bot")
+        tree = SimpleNamespace(copy_global_to=Mock(), sync=AsyncMock())
+        tasks = [FakeTask() for _ in range(5)]
+        namespace = on_ready.__globals__
+        namespace.update({
+            "CoreConfig": {"DiscordConfig": {"DiscordBroadcastChannel": "1", "DiscordDebugChannel": "2"},
+                           "AdvancedConfig": {"JoinMessage": "ready"}},
+            "discord_client": client, "discord": SimpleNamespace(Object=Mock()), "MainChannel": None,
+            "DebugChannel": None, "PlayerCommandsSyncedGuild": None, "tree": tree,
+            "CheckArchHost": tasks[0], "ProcessItemQueue": tasks[1], "ProcessDeathQueue": tasks[2],
+            "ProcessChatQueue": tasks[3], "CheckCommandQueue": tasks[4],
+            "StartDailyPostScheduler": AsyncMock(),
+        })
+        with unittest.mock.patch("builtins.print") as printed:
+            asyncio.run(on_ready())
+        tree.sync.assert_not_awaited()
+        tree.copy_global_to.assert_not_called()
+        for task in tasks:
+            task.start.assert_called_once_with()
+        self.assertTrue(any("configured broadcast channel is missing" in str(call) for call in printed.call_args_list))
+
+    def test_sync_failure_happens_after_background_tasks_start(self):
+        tasks = [FakeTask() for _ in range(5)]
+
+        async def fail_sync(*args, **kwargs):
+            self.assertTrue(all(task.is_running() for task in tasks))
+            raise RuntimeError("Discord temporarily unavailable")
+
+        on_ready = load_on_ready()
+        debug_channel = SimpleNamespace(send=AsyncMock())
+        main_channel = SimpleNamespace(guild=SimpleNamespace(id=123))
+        client = SimpleNamespace(get_channel=lambda channel_id: {1: main_channel, 2: debug_channel}[channel_id], user="mock bot")
+        tree = SimpleNamespace(copy_global_to=Mock(), sync=AsyncMock(side_effect=fail_sync))
+        namespace = on_ready.__globals__
+        namespace.update({
+            "CoreConfig": {"DiscordConfig": {"DiscordBroadcastChannel": "1", "DiscordDebugChannel": "2"},
+                           "AdvancedConfig": {"JoinMessage": "ready"}},
+            "discord_client": client, "discord": SimpleNamespace(Object=lambda id: SimpleNamespace(id=id)),
+            "MainChannel": None, "DebugChannel": None, "PlayerCommandsSyncedGuild": None, "tree": tree,
+            "CheckArchHost": tasks[0], "ProcessItemQueue": tasks[1], "ProcessDeathQueue": tasks[2],
+            "ProcessChatQueue": tasks[3], "CheckCommandQueue": tasks[4],
+            "StartDailyPostScheduler": AsyncMock(),
+        })
+        with unittest.mock.patch("builtins.print") as printed:
+            asyncio.run(on_ready())
+        tree.sync.assert_awaited_once()
+        for task in tasks:
+            task.start.assert_called_once_with()
+        printed_text = " ".join(str(call) for call in printed.call_args_list)
+        self.assertIn("RuntimeError", printed_text)
+        # Exception text can carry request details, so only the type is logged.
+        self.assertNotIn("Discord temporarily unavailable", printed_text)
 
 if __name__ == "__main__":
     unittest.main()

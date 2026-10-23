@@ -49,14 +49,22 @@ from bs4 import BeautifulSoup
 from discord.ext import tasks
 import discord
 from discord import app_commands
-from modules.player_commands import register_player_commands
+from modules.player_commands import HINT_FIELD_MAX_LENGTH, register_player_commands
 from modules.daily_post import (
     DailyPostConfigError,
     DailyPostState,
     load_daily_post_settings,
     run_daily_posts,
 )
-from modules.hint_relay import HintRelayState, format_hint_status, hint_subscription_keys, normalize_requested_hint, render_hint_message
+from modules.hint_relay import (
+    HintRelayState,
+    deliver_pending_hints,
+    format_hint_status,
+    hint_subscription_keys,
+    normalize_requested_hint,
+    render_hint_message,
+    unused_corrupt_path,
+)
 import time
 
 # Bridgeipelago Optional Modules
@@ -128,6 +136,38 @@ def GetCoreDirectory(folder):
         return str(os.getcwd() + CoreConfig["AdvancedConfig"]["ArchipelagoDataDirectory"] + CoreConfig["ArchipelagoConfig"]['UniqueID'] + '/')
     elif folder == "core":
         return str(os.getcwd())
+
+ItemQueueSafeChars = frozenset("0123456789 _.-")
+ItemQueueReservedNames = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + ["com" + str(number) for number in range(10)]
+    + ["lpt" + str(number) for number in range(10)]
+)
+
+def ItemQueueFileFor(slot):
+    # A slot name becomes a file name. Ordinary names (letters of any script,
+    # ASCII digits, space, _, -, .) keep the historical "<name>.csv"; every other
+    # character is percent-encoded, so the result can never contain a separator,
+    # ':' (an NTFS stream), or a Windows device name.
+    if slot is None:
+        return None
+    Name = str(slot).strip().lower()
+    if not Name:
+        return None
+    Encoded = "".join(
+        char if char in ItemQueueSafeChars or char.isalpha()
+        else "".join("%{:02X}".format(byte) for byte in char.encode("utf-8", "surrogatepass"))
+        for char in Name
+    )
+    if Name in (".", ".."):
+        Encoded = Encoded.replace(".", "%2E")
+    Base = Encoded.split(".", 1)[0].rstrip(" ")
+    if Base in ItemQueueReservedNames:
+        # Encode the first letter instead of adding a prefix: "_con" is a real
+        # slot whose file is "_con.csv", and encoding never yields "%63" etc.
+        # because the letters themselves are safe characters.
+        Encoded = "%{:02X}".format(ord(Encoded[0])) + Encoded[1:]
+    return GetCoreDirectory("item") + Encoded + ".csv"
     
 def GetCoreFiles(file):
     global CoreConfig
@@ -287,6 +327,10 @@ class TrackerClient():
     tags: set[str] = {'TextOnly','Tracker', 'DeathLink'}
     version: dict[str, any] = {"major": 0, "minor": 6, "build": 8, "class": "Version"}
     items_handling: int = 0b000  # This client does not receive any items
+    # SetReply packets can arrive before the initial Retrieved baseline. Keep
+    # only the newest few per store so a misbehaving server cannot grow this
+    # buffer without bound.
+    HINT_PREBASELINE_REPLY_LIMIT: int = 8
 
     class MessageCommand(Enum):
         BOUNCED = 'Bounced'
@@ -357,14 +401,20 @@ class TrackerClient():
                             if isinstance(retrieved, dict):
                                 for key, values in retrieved.items():
                                     key = str(key)
-                                    if key not in self.hint_baseline_keys or not isinstance(values, list):
+                                    # Only keys we subscribed to become baselines.
+                                    if key not in self.hint_baseline_keys:
                                         continue
                                     self.hint_baseline_keys.remove(key)
+                                    # A null or otherwise non-list store is an
+                                    # empty baseline. Otherwise its first
+                                    # SetReply would be silently baselined.
+                                    if not isinstance(values, list):
+                                        values = []
                                     baseline_count += 1
                                     baseline_hints += len(values)
-                                    self.queue_hint_snapshot(key, values, True)
+                                    self.queue_hint_snapshot(key, values)
                                     for early_values in self.hint_prebaseline_replies.pop(key, []):
-                                        self.queue_hint_snapshot(key, early_values, False)
+                                        self.queue_hint_snapshot(key, early_values)
                             print("-- Hint relay baseline processed: {} stores, {} hints.".format(baseline_count, baseline_hints))
                         elif cmd == 'SetReply' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
                             values = args.get('value')
@@ -373,9 +423,9 @@ class TrackerClient():
                                 if key not in self.hint_store_keys:
                                     continue
                                 if key in self.hint_baseline_keys:
-                                    self.hint_prebaseline_replies.setdefault(key, []).append(values)
+                                    self.buffer_prebaseline_reply(key, values)
                                 else:
-                                    self.queue_hint_snapshot(key, values, False)
+                                    self.queue_hint_snapshot(key, values)
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
                             print("Tracker Connection refused by server - check your slot name / port / whatever, and try again.")
                             WriteToErrorLog("Websocket", "Tracker Connection refused by server - check your slot name / port / whatever, and try again.")
@@ -509,12 +559,17 @@ class TrackerClient():
                 {"cmd": "Get", "keys": keys},
             ])
 
-    def queue_hint_snapshot(self, key: str, values: list, baseline: bool) -> None:
+    def buffer_prebaseline_reply(self, key: str, values: list) -> None:
+        replies = self.hint_prebaseline_replies.setdefault(key, [])
+        replies.append(values)
+        del replies[:-self.HINT_PREBASELINE_REPLY_LIMIT]
+
+    def queue_hint_snapshot(self, key: str, values: list) -> None:
         values = [dict(hint) if isinstance(hint, dict) else hint for hint in values]
         for hint in values:
             if isinstance(hint, dict):
                 hint.setdefault("team", HintRelayTeam)
-        chat_queue.put({"type": "HINT_SNAPSHOT", "data": {"key": key, "hints": values, "baseline": baseline}, "flag": "None"})
+        chat_queue.put({"type": "HINT_SNAPSHOT", "data": {"key": key, "hints": values}, "flag": "None"})
 
     def stop(self) -> None:
         self.is_closed.set()
@@ -774,24 +829,8 @@ async def on_ready():
     #await MainChannel.send('Bot connected. Battle control - Online.')
     global DebugChannel
     DebugChannel = discord_client.get_channel(int(CoreConfig["DiscordConfig"]["DiscordDebugChannel"]))
-    if CoreConfig["DiscordConfig"].get("AnnounceConnection", False):
+    if CoreConfig["DiscordConfig"].get("AnnounceConnection", False) and DebugChannel is not None:
         await DebugChannel.send('Bot connected. Debug control - Online.')
-
-    global PlayerCommandsSyncedGuild
-    guild_id = MainChannel.guild.id
-    if PlayerCommandsSyncedGuild != guild_id:
-        guild = discord.Object(id=guild_id)
-        tree.copy_global_to(guild=guild)
-        try:
-            await tree.sync(guild=guild)
-        except discord.HTTPException as e:
-            print(
-                "Player command sync failed for configured guild:",
-                e.status,
-                type(e).__name__,
-            )
-        else:
-            PlayerCommandsSyncedGuild = guild_id
 
     #Start background tasks
     if not CheckArchHost.is_running():
@@ -805,6 +844,23 @@ async def on_ready():
     if not CheckCommandQueue.is_running():
         CheckCommandQueue.start()
     await StartDailyPostScheduler()
+
+    # Keep relay work available even if Discord command registration is unavailable.
+    global PlayerCommandsSyncedGuild
+    guild = getattr(MainChannel, "guild", None) if MainChannel is not None else None
+    if guild is None:
+        print("Player command sync skipped: configured broadcast channel is missing or has no guild.")
+    else:
+        guild_id = guild.id
+        if PlayerCommandsSyncedGuild != guild_id:
+            guild_object = discord.Object(id=guild_id)
+            tree.copy_global_to(guild=guild_object)
+            try:
+                await tree.sync(guild=guild_object)
+            except Exception as e:
+                print("Player command sync failed for configured guild:", getattr(e, "status", None), type(e).__name__)
+            else:
+                PlayerCommandsSyncedGuild = guild_id
 
     print("++ ",CoreConfig["AdvancedConfig"]["JoinMessage"])
     print("++ Async bot started -", discord_client.user)
@@ -830,6 +886,14 @@ HelpText = """**Archipelago bot commands** (only work in this channel, lowercase
 
 If the room moves to a new port, the bot posts the new address here."""
 
+def IsBotAdmin(author):
+    # Only trust the guild permissions supplied by Discord; never parse roles
+    # or names from the message itself.
+    permissions = getattr(author, "guild_permissions", None)
+    if permissions is None:
+        return False
+    return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
+
 @discord_client.event
 async def on_message(message):
     if message.author == discord_client.user:
@@ -839,11 +903,14 @@ async def on_message(message):
         return
     
     # Registers user for a alot in Archipelago
-    if message.content.startswith('$register'):
-        ArchSlot = message.content
-        ArchSlot = ArchSlot.replace("$register ","")
-        Status = await Command_Register(str(message.author),ArchSlot)
-        await SendMainChannelMessage(Status)
+    RegisterParts = message.content.split(None, 1)
+    if RegisterParts and RegisterParts[0] == '$register':
+        ArchSlot = RegisterParts[1].strip() if len(RegisterParts) > 1 else ""
+        if ArchSlot == "":
+            await SendMainChannelMessage("Use `$register <slot>` with the exact slot name from Archipelago.")
+        else:
+            Status = await Command_Register(str(message.author),ArchSlot)
+            await SendMainChannelMessage(Status)
 
     # Clears registration file for user
     if message.content.startswith('$clearreg'):
@@ -863,18 +930,24 @@ async def on_message(message):
     ## Yoinks the specified ItemQueue file, scans through it, then sends the contents to the user
     ## Does NOT delete the file, as it's assumed the other users will want to read the file as well
     if message.content.startswith('$groupcheck'):
-        game = (message.content).split('$groupcheck ')
-        await Command_GroupCheck(message.author, game[1])
+        game = message.content[len('$groupcheck'):].strip()
+        if game == "":
+            await SendMainChannelMessage("Use `$groupcheck <slot>` to see the queued items for a slot.")
+        else:
+            await Command_GroupCheck(message.author, game)
     
     if message.content.startswith('$hints'):
         await Command_Hints(message.author)
     
     if message.content.startswith('$hint '):
         hintrequest = [item.strip() for item in ((message.content).split('$hint '))[1].split('|')]
-        if(len(hintrequest)==2):
-            hint_queue.put(hintrequest)
-        else:
+        if not(len(hintrequest)==2 and all(hintrequest)):
             await SendMainChannelMessage("Invalid $hint format. Use `$hint <slot>|<item>`")
+        elif any(len(field) > HINT_FIELD_MAX_LENGTH for field in hintrequest):
+            await SendMainChannelMessage("Slot and item must each be {} characters or fewer.".format(HINT_FIELD_MAX_LENGTH))
+        else:
+            hint_queue.put(hintrequest)
+            await SendMainChannelMessage(str(message.author) + " requested a hint for " + hintrequest[0] + ": " + hintrequest[1])
 
     if message.content.startswith('$deathcount'):
         await Command_DeathCount()
@@ -896,18 +969,35 @@ async def on_message(message):
         await Command_Hello(message)
     
     if message.content.startswith('$archinfo'):
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
         await Command_ArchInfo(message)
 
     if message.content.startswith('$setconfig'):
-        pair = ((message.content).split('$setconfig '))[1].split(' ')
-        rtrnmessage = SetConfigVariable(pair[0], pair[1])
-        await SendMainChannelMessage(rtrnmessage)
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
+        settings = message.content[len('$setconfig'):].strip()
+        key, separator, value = settings.partition(' ')
+        value = value.strip()
+        if separator == "" or key == "" or value == "":
+            await SendMainChannelMessage("Invalid $setconfig format. Use `$setconfig <key> <value>`")
+        else:
+            rtrnmessage = SetConfigVariable(key, value)
+            await SendMainChannelMessage(rtrnmessage)
 
     if message.content.startswith('$reloadtracker'):
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
         ReloadBot()
         await SendMainChannelMessage("Reloading tracker... Please wait about 5-10 seconds.")
     
     if message.content.startswith('$reloaddiscord'):
+        if not IsBotAdmin(message.author):
+            await message.channel.send("Only server administrators can use that command.")
+            return
         discordseppuku_queue.put("Reloading Discord bot...")
         await SendMainChannelMessage("Reloading Discord bot... Please wait.")
 
@@ -946,7 +1036,15 @@ CheckArchHostAlertSent = False
 
 def AlertMention():
     AlertUserID = str(CoreConfig["DiscordConfig"].get("DiscordAlertUserID", "")).strip()
-    return " <@" + AlertUserID + ">" if AlertUserID else ""
+    if AlertUserID == "":
+        return ""
+    if AlertUserID.startswith("&"):
+        if AlertUserID[1:].isdigit():
+            return " <@&" + AlertUserID[1:] + ">"
+    elif AlertUserID.isdigit():
+        return " <@" + AlertUserID + ">"
+    WriteToErrorLog("AlertMention", "DiscordAlertUserID must be a numeric user ID or '&role-id': " + AlertUserID)
+    return ""
 
 async def RecordCheckArchHostFailure(Error):
     global CheckArchHostFailureCount, CheckArchHostAlertSent
@@ -974,24 +1072,31 @@ async def CheckArchHost():
             ArchRoomID = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")
             ArchAPIUEL = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/room/")
             RoomAPI = ArchAPIUEL[0]+"/api/room_status/"+ArchRoomID[4]
-            RoomPage = requests.get(RoomAPI, timeout=10)
+            RoomPage = await asyncio.to_thread(requests.get, RoomAPI, timeout=10)
+            RoomPage.raise_for_status()
             RoomData = json.loads(RoomPage.content)
+            raw_last_port = RoomData["last_port"]
+            if isinstance(raw_last_port, bool) or (isinstance(raw_last_port, float) and not raw_last_port.is_integer()):
+                raise ValueError("last_port must be an integer")
+            last_port = int(raw_last_port)
+            if not 1 <= last_port <= 65535:
+                raise ValueError("last_port must be between 1 and 65535")
             await ResetCheckArchHostFailures()
 
-            cond = str(RoomData["last_port"])
-            if(int(cond) == CoreConfig["ArchipelagoConfig"]['ArchipelagoPort']):
+            if last_port == int(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort']):
                 return
             else:
                 print("Port Check Failed")
-                print(RoomData["last_port"])
+                print(last_port)
                 print(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'])
-                message = "Port Check Failed.  New port is " + str(RoomData["last_port"]) + "."
+                message = "Port Check Failed.  New port is " + str(last_port) + "."
                 #await MainChannel.send(message)
                 await DebugChannel.send(message)
                 # Local patch: tell players where the room moved.
-                SetConfigVariable("ArchipelagoPort", int(RoomData["last_port"]))
+                SetConfigVariable("ArchipelagoPort", last_port)
                 RoomHost = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")[2]
-                await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(RoomData["last_port"]) + "**")
+                if MainChannel is not None:
+                    await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(last_port) + "**")
         
         # We catch both TypeError and JSONDecodeError becuase they are what are thrown when the Arch server is unresponsive.
         # We don't REALLY mind these, as it's a byproduct of the server being offline and we're unable to fetch it properly.
@@ -999,7 +1104,7 @@ async def CheckArchHost():
         except TypeError as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: [TypeError] " + str(e))
             await RecordCheckArchHostFailure(e)
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, ValueError) as e:
             WriteToErrorLog("CheckArchHost", "Error occurred while checking ArchHost: [JSONDecodingError] " + str(e))
             await RecordCheckArchHostFailure(e)
         except Exception as e:
@@ -1055,15 +1160,21 @@ async def ProcessItemQueue():
                 o.close()
 
                 if int(itemclass) == 4 and CoreConfig["ItemFilterConfig"]["BotItemSpoilTraps"] == True:
-                    ItemQueueFile = GetCoreDirectory("item") + recipient.lower() + ".csv"
-                    i = open(ItemQueueFile, "a")
-                    i.write(ItemCheckLogMessage)
-                    i.close()
+                    ItemQueueFile = ItemQueueFileFor(recipient)
+                    if ItemQueueFile is None:
+                        WriteToErrorLog("ItemQueue", "Refusing invalid item queue slot name: " + str(recipient))
+                    else:
+                        i = open(ItemQueueFile, "a")
+                        i.write(ItemCheckLogMessage)
+                        i.close()
                 elif int(itemclass) != 4:
-                    ItemQueueFile = GetCoreDirectory("item") + recipient.lower() + ".csv"
-                    i = open(ItemQueueFile, "a")
-                    i.write(ItemCheckLogMessage)
-                    i.close()
+                    ItemQueueFile = ItemQueueFileFor(recipient)
+                    if ItemQueueFile is None:
+                        WriteToErrorLog("ItemQueue", "Refusing invalid item queue slot name: " + str(recipient))
+                    else:
+                        i = open(ItemQueueFile, "a")
+                        i.write(ItemCheckLogMessage)
+                        i.close()
             else:
                 message = "Unknown Item Send :("
                 print(message)
@@ -1143,20 +1254,49 @@ async def SendHintResult(hint):
     })
     await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
 
-async def HandleHintRelayMessage(message):
+def ReportHintRelayDeliveryIssue(summary):
+    """Log one short, payload-free hint delivery summary."""
+    try:
+        WriteToErrorLog("HintRelay", str(summary))
+    except Exception:
+        pass
+
+async def InitializeHintRelayState():
+    """Load durable hint relay state once, including pending deliveries."""
     global HintRelayStateInstance
     if HintRelayStateInstance is None:
-        HintRelayStateInstance = HintRelayState(GetCoreFiles("hintrelay"))
-        if HintRelayStateInstance.corrupt:
-            print("-- Hint relay state was unreadable; the next store snapshots will be silently baselined.")
-    if message["type"] == "HINT_SNAPSHOT":
-        data = message.get("data", {})
-        HintRelayStateInstance.observe_snapshot(data.get("key", ""), data.get("hints", []))
-    elif message["type"] == "HINT_REQUESTED":
-        HintRelayStateInstance.enqueue_requested(message.get("data", {}))
-    for identity, hint in HintRelayStateInstance.pending_items():
-        await SendHintResult(hint)
-        HintRelayStateInstance.mark_delivered(identity)
+        state = HintRelayState(GetCoreFiles("hintrelay"))
+        HintRelayStateInstance = state
+        if state.corrupt:
+            # Logged once per process, when the state is first loaded.
+            if state.corrupt_backup is not None:
+                Notice = "Hint relay state was unreadable and was moved to " + state.corrupt_backup + "; the next store snapshots will be silently baselined."
+            else:
+                Notice = "Hint relay state was unreadable and could not be moved aside (" + str(state.corrupt_error) + "); saving stays blocked until it can be."
+            print("-- " + Notice)
+            WriteToErrorLog("HintRelay", Notice)
+    return HintRelayStateInstance
+
+async def DeliverPendingHintResults():
+    """Send due pending hint results with per-item isolation."""
+    state = HintRelayStateInstance
+    if state is None:
+        return 0
+    return await deliver_pending_hints(state, SendHintResult, log=ReportHintRelayDeliveryIssue)
+
+async def HandleHintRelayMessage(message):
+    try:
+        state = await InitializeHintRelayState()
+        message_type = message.get("type") if isinstance(message, dict) else None
+        if message_type == "HINT_SNAPSHOT":
+            data = message.get("data", {})
+            if isinstance(data, dict):
+                state.observe_snapshot(data.get("key", ""), data.get("hints", []))
+        elif message_type == "HINT_REQUESTED":
+            state.enqueue_requested(message.get("data", {}))
+    except Exception as e:
+        ReportHintRelayDeliveryIssue("hint relay state update failed: " + type(e).__name__)
+    await DeliverPendingHintResults()
 
 @tasks.loop(seconds=float(OverClockValue))
 async def ProcessChatQueue():
@@ -1181,16 +1321,23 @@ async def ProcessChatQueue():
     # MessageObject = {"type": "CORE", "data": args, "flag": "None"}
     
     try:
-        if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True and HintRelayStateInstance is not None:
-            for identity, hint in HintRelayStateInstance.pending_items():
-                await SendHintResult(hint)
-                HintRelayStateInstance.mark_delivered(identity)
+        if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+            try:
+                await InitializeHintRelayState()
+                await DeliverPendingHintResults()
+            except Exception as e:
+                # Hint delivery is best effort and must never starve chat.
+                ReportHintRelayDeliveryIssue("hint relay delivery pass failed: " + type(e).__name__)
         if chat_queue.empty():
             return
         else:
             Message = chat_queue.get()
             if Message['type'] in ("HINT_SNAPSHOT", "HINT_REQUESTED"):
-                await HandleHintRelayMessage(Message)
+                try:
+                    await HandleHintRelayMessage(Message)
+                except Exception as e:
+                    # Never leak a full hint snapshot into the error log.
+                    ReportHintRelayDeliveryIssue("hint relay message failed: " + type(e).__name__)
             elif Message['type'] == "CORE":
                 await SendMainChannelMessage(Message['data']['text'])
             elif Message['type'] == "HTMessage":
@@ -1294,7 +1441,8 @@ async def ProcessChatQueue():
         await SendDebugChannelMessage("Error In Chat Queue Process")
 
 async def SendMainChannelMessage(message):
-    await MainChannel.send(message)
+    # Relayed Archipelago chat must never be able to ping @everyone or roles.
+    await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
 
 async def SendDebugChannelMessage(message):
     await DebugChannel.send(message)
@@ -1302,8 +1450,70 @@ async def SendDebugChannelMessage(message):
 async def SendDMMessage(message,user):
     await MainChannel.send(message)
 
-async def Command_Register(Sender:str, ArchSlot:str):
+def CatchupStartFileFor(Sender):
+    # Registration files are keyed by the Discord name, so the start marks are too.
+    SafeName = "".join(char if char.isalnum() or char in "-_." else "_" for char in str(Sender))
+    if SafeName in ("", ".", ".."):
+        SafeName = "user"
+    return GetCoreDirectory("reg") + "catchup-start/" + SafeName + ".json"
+
+def MoveCatchupStartAside(StartFile):
+    """Keep an unreadable start-mark file for recovery. Returns False if it could not be moved."""
     try:
+        os.replace(StartFile, unused_corrupt_path(StartFile))
+        return True
+    except OSError as e:
+        WriteToErrorLog("CatchupStart", "Could not move unreadable catch-up start marks aside: " + str(e))
+        return False
+
+def LoadCatchupStart(Sender):
+    """Return the start marks, or None when the file exists but cannot be read."""
+    StartFile = CatchupStartFileFor(Sender)
+    try:
+        if not os.path.isfile(StartFile):
+            return {}
+        with open(StartFile, "r") as StartInput:
+            Loaded = json.load(StartInput)
+        if not isinstance(Loaded, dict):
+            raise ValueError("catch-up start marks are not an object")
+        return {str(Slot).strip().lower(): max(0, int(Count)) for Slot, Count in Loaded.items()}
+    except Exception as e:
+        WriteToErrorLog("CatchupStart", "Could not read catch-up start marks: " + str(e))
+        # The other slots' marks are still in this file, so move it aside rather than let a write replace it.
+        MoveCatchupStartAside(StartFile)
+        return None
+
+def RecordCatchupStart(Sender, ArchSlot):
+    """Start a new registrant at the current end of the slot queue, not its full history."""
+    try:
+        ItemQueueFile = ItemQueueFileFor(ArchSlot)
+        QueueLength = 0
+        if ItemQueueFile is not None and os.path.isfile(ItemQueueFile):
+            with open(ItemQueueFile, "r") as QueueInput:
+                QueueLength = len(QueueInput.readlines())
+        StartFile = CatchupStartFileFor(Sender)
+        StartMarks = LoadCatchupStart(Sender)
+        if StartMarks is None:
+            if os.path.isfile(StartFile):
+                # The unreadable file is still in place, so writing would erase the other slots' marks.
+                WriteToErrorLog("CatchupStart", "Skipped recording catch-up start mark; unreadable marks left in place.")
+                return
+            StartMarks = {}
+        StartMarks[str(ArchSlot).strip().lower()] = QueueLength
+        os.makedirs(os.path.dirname(StartFile), exist_ok=True)
+        TemporaryFile = StartFile + ".tmp"
+        with open(TemporaryFile, "w") as StartOutput:
+            json.dump(StartMarks, StartOutput, indent=4)
+        os.replace(TemporaryFile, StartFile)
+    except Exception as e:
+        WriteToErrorLog("CatchupStart", "Could not record catch-up start mark: " + str(e))
+
+async def Command_Register(Sender:str, ArchSlot:str):
+    ArchSlot = str(ArchSlot).strip()
+    try:
+        if ItemQueueFileFor(ArchSlot) is None:
+            return "That slot name is invalid. Use the exact slot name from Archipelago."
+
         #Compile the Registration File's path
         RegistrationFile = GetCoreDirectory("reg") + Sender + ".json"
 
@@ -1321,6 +1531,7 @@ async def Command_Register(Sender:str, ArchSlot:str):
 
             RegistrationContents.append(ArchSlot)
             json.dump(RegistrationContents, open(RegistrationFile, "w"), indent=4)
+            RecordCatchupStart(Sender, ArchSlot)
             return "You've been registered for " + ArchSlot + "!"
         else:
             return "You're already registered for that slot."
@@ -1351,10 +1562,12 @@ async def Command_ListRegistrations(Sender):
     except discord.Forbidden as e:
         WriteToErrorLog("Command_ListRegistrations", "Can not send a DM to "+ str(Sender) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_ListRegistrations", "Error in list registrations command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN LISTREG"+AlertMention())
+        return False
 
 async def Command_ClearReg(Sender:str):
     try:
@@ -1368,7 +1581,26 @@ async def Command_ClearReg(Sender:str):
         print(e)
         await DebugChannel.send("ERROR IN CLEARREG"+AlertMention())
 
+def CatchupUserKey(User):
+    # One durable cursor per Discord user, keyed by user ID when it is known.
+    UserID = getattr(User, "id", None)
+    if UserID is None:
+        UserKey = "".join(char if char.isalnum() or char in "-_." else "_" for char in str(User))
+    else:
+        UserKey = str(UserID)
+    if UserKey in ("", ".", ".."):
+        UserKey = "user"
+    return UserKey
+
+# One lock per user, keyed like the cursor file. Without it, two quick
+# $ketchmeup calls read the same cursor and DM the same items twice.
+CatchupLocks = {}
+
 async def Command_KetchMeUp(User, message_filter):
+    async with CatchupLocks.setdefault(CatchupUserKey(User), asyncio.Lock()):
+        return await KetchMeUpLocked(User, message_filter)
+
+async def KetchMeUpLocked(User, message_filter):
     try:
         message_filter = message_filter.replace("$ketchmeup","")
         message_filter = message_filter.replace("/ketchmeup","")
@@ -1385,72 +1617,118 @@ async def Command_KetchMeUp(User, message_filter):
         if not os.path.isfile(RegistrationFile):
             await User.send("You've not registered for a slot : (")
         else:
+            # Catching up never removes the shared queue from other players registered to the same slot.
+            UserKey = CatchupUserKey(User)
+
+            CursorDirectory = GetCoreDirectory("reg") + "catchup/"
+            CursorFile = CursorDirectory + UserKey + ".json"
+            Cursor = {}
+            try:
+                if os.path.isfile(CursorFile):
+                    LoadedCursor = json.load(open(CursorFile, "r"))
+                    if isinstance(LoadedCursor, dict):
+                        for StoredSlot, Delivered in LoadedCursor.items():
+                            try:
+                                Cursor[str(StoredSlot).strip().lower()] = max(0, int(Delivered))
+                            except (TypeError, ValueError):
+                                continue
+            except Exception as e:
+                WriteToErrorLog("Command_KetchMeUp", "Could not read catch-up cursor: " + str(e))
+                Cursor = {}
+
+            try:
+                os.makedirs(CursorDirectory, exist_ok=True)
+            except OSError as e:
+                WriteToErrorLog("Command_KetchMeUp", "Could not create catch-up cursor directory: " + str(e))
+
+            def SaveCursor():
+                TemporaryFile = CursorFile + ".tmp"
+                try:
+                    with open(TemporaryFile, "w") as CursorOutput:
+                        json.dump(Cursor, CursorOutput, indent=4)
+                    os.replace(TemporaryFile, CursorFile)
+                finally:
+                    if os.path.exists(TemporaryFile):
+                        os.remove(TemporaryFile)
+
+            CatchupStart = LoadCatchupStart(User) or {}
             RegistrationContents = json.load(open(RegistrationFile, "r"))
             for reglines in RegistrationContents:
-                ItemQueueFile = GetCoreDirectory("item") + (reglines.lower()).strip() + ".csv"
+                SlotName = str(reglines).strip()
+                ItemQueueFile = ItemQueueFileFor(SlotName)
+                if ItemQueueFile is None:
+                    await User.send("Skipping invalid slot name: " + SlotName)
+                    continue
                 if not os.path.isfile(ItemQueueFile):
-                    await User.send("There are no items for " + reglines.strip() + " :/")
+                    await User.send("There are no items for " + SlotName + " :/")
                     continue
                 k = open(ItemQueueFile, "r")
                 ItemQueueLines = k.readlines()
                 k.close()
-                os.remove(ItemQueueFile)
-        
-                YouWidth = 0
-                ItemWidth = 0
-                SenderWidth = 0
-                YouArray = [0]
-                ItemArray = [0]
-                SenderArray = [0]
-        
-                for line in ItemQueueLines:
-                    YouArray.append(len(line.split("||")[0]))
-                    ItemArray.append(len(line.split("||")[1]))
-                    SenderArray.append(len(line.split("||")[2]))
-                
-                YouArray.sort(reverse=True)
-                ItemArray.sort(reverse=True)
-                SenderArray.sort(reverse=True)
-        
-                YouWidth = YouArray[0]
-                ItemWidth = ItemArray[0]
-                SenderWidth = SenderArray[0]
-        
-                You = "You"
-                Item = "Item"
-                Sender = "Sender"
-                Location = "Location"
-        
-                ketchupmessage = "```" + You.ljust(YouWidth) + " || " + Item.ljust(ItemWidth) + " || " + Sender.ljust(SenderWidth) + " || " + Location + "\n"
-                for line in ItemQueueLines:
-                    You = line.split("||")[0].strip()
-                    Item = line.split("||")[1].strip()
-                    Sender = line.split("||")[2].strip()
-                    Location = line.split("||")[3].strip()
-                    Class = line.split("||")[4].strip()
 
-                    if ItemFilter(int(Class),int(message_filter)):
+                CursorKey = SlotName.strip().lower()
+                if CursorKey not in Cursor:
+                    # First catch-up: begin where this user registered.
+                    Cursor[CursorKey] = CatchupStart.get(CursorKey, 0)
+                Delivered = Cursor[CursorKey]
+                if Delivered < 0 or Delivered > len(ItemQueueLines):
+                    Delivered = 0
+
+                YouWidth = len("You")
+                ItemWidth = len("Item")
+                SenderWidth = len("Sender")
+                NewRows = []
+                for line in ItemQueueLines[Delivered:]:
+                    Fields = line.split("||")
+                    if len(Fields) < 5:
+                        continue
+                    try:
+                        ItemClass = int(Fields[4].strip())
+                    except (TypeError, ValueError):
+                        continue
+                    if not ItemFilter(ItemClass, int(message_filter)):
+                        continue
+                    You = Fields[0].strip()
+                    Item = Fields[1].strip()
+                    Sender = Fields[2].strip()
+                    Location = Fields[3].strip()
+                    NewRows.append((You, Item, Sender, Location))
+                    YouWidth = max(YouWidth, len(You))
+                    ItemWidth = max(ItemWidth, len(Item))
+                    SenderWidth = max(SenderWidth, len(Sender))
+
+                if NewRows:
+                    ketchupmessage = "```" + "You".ljust(YouWidth) + " || " + "Item".ljust(ItemWidth) + " || " + "Sender".ljust(SenderWidth) + " || Location\n"
+                    for You, Item, Sender, Location in NewRows:
                         ketchupmessage = ketchupmessage + You.ljust(YouWidth) + " || " + Item.ljust(ItemWidth) + " || " + Sender.ljust(SenderWidth) + " || " + Location + "\n"
 
-                    if len(ketchupmessage) > 1500:
-                        ketchupmessage = ketchupmessage + "```"
+                        if len(ketchupmessage) > 1500:
+                            ketchupmessage = ketchupmessage + "```"
+                            await User.send(ketchupmessage)
+                            ketchupmessage = "```"
+                    ketchupmessage = ketchupmessage + "```"
+                    if not ketchupmessage == "``````":
                         await User.send(ketchupmessage)
-                        ketchupmessage = "```"
-                ketchupmessage = ketchupmessage + "```"
-                if not ketchupmessage == "``````":
-                    await User.send(ketchupmessage)
+
+                # Only advance after every DM for this slot succeeded.
+                Cursor[CursorKey] = len(ItemQueueLines)
+                SaveCursor()
     except discord.Forbidden as e:
         WriteToErrorLog("Command_KetchMeUp", "Can not send a DM to "+ str(User) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_KetchMeUp", "Error in ketch me up command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN KETCHMEUP"+AlertMention())
+        return False
 
 async def Command_GroupCheck(DMauthor, game):
     try:
-        ItemQueueFile = GetCoreDirectory("item") + game + ".csv"
-        if not os.path.isfile(ItemQueueFile):
+        ItemQueueFile = ItemQueueFileFor(game)
+        if ItemQueueFile is None:
+            await DMauthor.send("That slot name is invalid.")
+        elif not os.path.isfile(ItemQueueFile):
             await DMauthor.send("There are no items for " + game + " :/")
         else:
             k = open(ItemQueueFile, "r")
@@ -1470,10 +1748,12 @@ async def Command_GroupCheck(DMauthor, game):
     except discord.Forbidden as e:
         WriteToErrorLog("Command_GroupCheck", "Can not send a DM to "+ str(DMauthor) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_GroupCheck", "Error in group check command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN GROUPCHECK"+AlertMention())
+        return False
 
 async def Command_Hints(player):
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"] == True:
@@ -1586,10 +1866,12 @@ async def Command_Hints(player):
     except discord.Forbidden as e:
         WriteToErrorLog("Command_Hints", "Can not send a DM to "+ str(player) + " - " + str(e))
         await MainChannel.send("I can't send you a DM! Please check your privacy settings and try again.")
+        return False
     except Exception as e:
         WriteToErrorLog("Command_Hints", "Error in hints command: " + str(e))
         print(e)
         await DebugChannel.send("ERROR IN HINTLIST"+AlertMention())
+        return False
 
 async def Command_DeathCount():
     fig = None
@@ -1885,35 +2167,42 @@ async def Command_ILoveYou(message):
 async def Command_Hello(message):
     await message.channel.send('Hello!')
 
+def RedactConfigValue(key, value):
+    KeyName = str(key).lower()
+    for SecretWord in ("token", "password", "secret"):
+        if SecretWord in KeyName:
+            return "<redacted>"
+    return str(value)
+
 async def Command_ArchInfo(message):
     if(CoreConfig["AdvancedConfig"]["DebugMode"] == True):
         print("== Discord Config")
         for key, value in CoreConfig["DiscordConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== ArchipelagoConfig Config")
         for key, value in CoreConfig["ArchipelagoConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== ItemFilterConfig Config")
         for key, value in CoreConfig["ItemFilterConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== RelayConfig Config")
         for key, value in CoreConfig["RelayConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== DrawbridgeConfig Config")
         for key, value in CoreConfig["DrawbridgeConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== MetaConfig Config")
         for key, value in CoreConfig["MetaConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
             
         print("== AdvancedConfig Config")
         for key, value in CoreConfig["AdvancedConfig"].items():
-            print(str(key) + ": " + str(value))
+            print(str(key) + ": " + RedactConfigValue(key, value))
     else:
         await message.channel.send("Debug Mode is disabled.")
 
@@ -2159,6 +2448,22 @@ def SetConfigVariable(key, value):
     if key not in ["ArchipelagoPort","ArchipelagoPassword","ArchipelagoTrackerURL","ArchipelagoServerURL","UniqueID"]:
         return "Invalid key. Only 'ArchipelagoPort', 'ArchipelagoPassword', 'ArchipelagoTrackerURL', 'ArchipelagoServerURL', and 'UniqueID' can be set."
     else:
+        if key == "ArchipelagoPort":
+            try:
+                PortValue = int(str(value).strip())
+            except (TypeError, ValueError):
+                return "Invalid ArchipelagoPort. Use a whole number from 1 to 65535."
+            if not 1 <= PortValue <= 65535:
+                return "Invalid ArchipelagoPort. Use a whole number from 1 to 65535."
+            value = PortValue
+        if key == "UniqueID":
+            UniqueIDValue = str(value)
+            if UniqueIDValue in ("", ".", ".."):
+                return "Invalid UniqueID. Use a plain value without path separators or control characters."
+            if any(char in UniqueIDValue for char in ("/", "\\")):
+                return "Invalid UniqueID. Use a plain value without path separators or control characters."
+            if any(ord(char) < 32 or ord(char) == 127 for char in UniqueIDValue):
+                return "Invalid UniqueID. Use a plain value without path separators or control characters."
         with ConfigLock:
             if key == "ArchipelagoPort":
                 CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'] = value
@@ -2177,11 +2482,14 @@ def SetConfigVariable(key, value):
             
             # Convert shared dict to regular dict for JSON serialization
             config_for_json = {k: dict(v) if hasattr(v, 'keys') else v for k, v in CoreConfig.items()}
-            json.dump(config_for_json, open('config.json', "w"), indent=4)
+            with open('config.json', "w") as config_file:
+                json.dump(config_for_json, config_file, indent=4)
 
         #We'll reconfirm and reload the data locations since we can change values.
         ConfirmSpecialFiles()
-        return "Key '" + key + "' set to '" + value + "'!"
+        if key == "ArchipelagoPassword":
+            return "Key 'ArchipelagoPassword' updated."
+        return "Key '" + key + "' set to '" + str(value) + "'!"
 
 def ReloadBot():
     global ToggleConfig

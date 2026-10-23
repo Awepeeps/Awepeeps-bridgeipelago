@@ -63,7 +63,9 @@ You can also ask the bot to DM you all the items you've gained since last asking
 (See the registration below)
 
 **IMPORTANT NOTES:**
-- This will send you EVERYTHING you've registered for since last asking. So even as you're playing and someone sends you an item, it'll still appear in the queue to be sent to you. (as the bot has no idea if you're playing or not)
+- This sends only the items queued for your registered slots since your last catch-up. Each Discord account keeps its own position, so catching up never removes items for other players registered to the same slot, and the queue file itself is not deleted. Items sent to you while you're still playing will appear in your next catch-up, because the bot has no idea if you're playing or not.
+- A slot you newly register for starts at the queue's current end. Accounts registered before this change have no saved position, so their first catch-up sends everything still in that slot's queue file.
+- Overlapping `$ketchmeup` calls from the same account run one at a time, so two quick calls never DM the same items twice.
 - The bot will NOT log items you give to your own game. You're expected to remember what you find for yourself
 - However the bot only understands slots. So if you're playing two games, the bot just assumes the other game is someone else and logs it. While ignoring the checks from your own game.
 
@@ -89,17 +91,17 @@ and how channel posts differ from personal DMs, see [Item notification filters](
 **All commands are case-sensitive.**
 |Player Commands|Description|
 |---|---|
-|`$register <slot>`|Adds the slot provided to the user's registration file|
+|`$register <slot>`|Adds the slot provided to the user's registration file. A blank slot gets the usage reply instead. Queue file names are derived from the slot: ordinary names keep `<name>.csv`, while Windows device names and characters such as `:` or `/` are percent-encoded (`Con` is stored as `%63on.csv`, `A:B` as `a%3Ab.csv`)|
 |`$listreg`|Lists all the slots you are registered for|
 |`$clearreg`|Clears the user's registration file|
-|`$ketchmeup <filter>`|DMs the user all checks in their ItemQueue file, used to catch you up on missed checks|
+|`$ketchmeup <filter>`|DMs the checks queued for your registered slots since your last catch-up (tracked per Discord account; see Ketchmeup above)|
 ||`2` - Only Logical Progression Items|
 ||`1` - Logical + Useful items|
 ||`0` or empty - Logical + Useful + Normal items + Traps\*|
 ||\*Traps will only be sent if the filter is 0 AND BotItemSpoilTraps is enabled in the config|
-|`$groupcheck <slot>`|DMs the user all checks in the slot's ItemQueue file, used to catch up on group games|
+|`$groupcheck <slot>`|DMs the user all checks in the slot's ItemQueue file (the full stored queue, not a per-account position), used to catch up on group games|
 |`$hints`|DMs the hinted items for a player's registered slots|
-|`$hint <slot> \| <item>`|Allows you to request a hint from Archipelago and it'll be relayed to discord|
+|`$hint <slot> \| <item>`|Allows you to request a hint from Archipelago and it'll be relayed to discord. The request is acknowledged publicly in the channel, naming you, with mentions suppressed. The slot and item are each limited to 100 characters, as with `/hint`|
 |`$deathcount`|Scans the deathlog and tallies up the current deathcount for each slot|
 |`$checkcount`|Fetches the current Arch server's progress in simple txt format|
 |`$checkgraph`|Plots the current Arch progress in a picture|
@@ -107,7 +109,7 @@ and how channel posts differ from personal DMs, see [Item notification filters](
 See [Hint result notifications](docs/hint-notifications.md) for relay settings,
 deduplication, and delivery behavior.
 
-|Admin Commands|Description|
+|Maintenance Commands|Description|
 |---|---|
 |`$iloveyou`|We all need to hear this sometimes.|
 |`$hello`|The bot says hello!|
@@ -116,6 +118,10 @@ deduplication, and delivery behavior.
 |`$setconfig <key> <value>`|Allows you to set config.json options via discord|
 ||Current keys: `ArchipelagoPort`, `ArchipelagoPassword`, `ArchipelagoTrackerURL`, `ArchipelagoServerURL`, `UniqueID`|
 |`$ArchInfo`|\[CONSOLE] General bot details for debugging config values [1]|
+
+`$setconfig`, `$reloadtracker`, `$reloaddiscord`, and `$archinfo` only run for members with **Administrator** or **Manage Server** permission in the server; other members get a refusal. The bot reads that permission from Discord, not from the message. `$setconfig` accepts `ArchipelagoPassword` from an admin but never echoes a password or token back to the channel, and `$archinfo` prints secret-named values (keys containing `token`, `password`, or `secret`) as `<redacted>`. `UniqueID` values containing path separators or control characters are rejected. If the room password was ever typed in the channel, rotate it on the room. `$hello` and `$iloveyou` are not gated. Bot commands are only read in the broadcast channel.
+
+Relayed Archipelago chat, hint results, and `/hint` or `$hint` acknowledgements are sent with Discord mentions suppressed, so they never ping anyone. Debug-channel error alerts still mention the `DiscordAlertUserID` you configure.
 
 **\[1] DebugMode only commands**  
 **\[1] DebugMode can expose unintended system information. Use with care.**
@@ -126,7 +132,7 @@ deduplication, and delivery behavior.
 |**Discord Config**||
 |`DiscordToken`|Your Discord Bot's token|
 |`DiscordBroadcastChannel`|Discord channel ID for AP notifications and player commands|
-|`DiscordAlertUserID`|Optional Discord User/Group ID to mention in error alerts [1]; CheckArchHost alerts after 5 consecutive failed checks|
+|`DiscordAlertUserID`|Optional Discord **user** ID, or `&` followed by a role ID, to mention in debug-channel error alerts [7]. Any other value is logged and not mentioned. CheckArchHost alerts once after 5 consecutive failed checks; the next valid check after that alert posts a recovery notice|
 |`DiscordDebugChannel`|Discord channel ID for admin/debug alerts; may match `DiscordBroadcastChannel` to keep bot activity in one channel|
 |`AnnounceConnection`|Send a debug-channel startup announcement (default: `false`)|
 |||
@@ -211,7 +217,7 @@ deduplication, and delivery behavior.
 |`SelfHostNoWeb`|Disabled WebHost-specific functionality for self-hosted games with no WebHost module|
 |`CycleDiscord`|Setting to a value above 0 will restart the discord process every X seconds|
 
-**\[1] For group IDs, ensure the '&' character is at the beginning of the ID** 
+**\[7] Use a numeric user ID, or `&` followed by a numeric role ID (for example `&123456789`) to mention a role. The `&` must be the first character.**
 
 **\[2] Check [UniqueID](docs/setup.md/#UniqueID) in the setup readme on what this value is used for**  
 

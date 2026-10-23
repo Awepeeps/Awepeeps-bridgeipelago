@@ -66,7 +66,7 @@ You're done with the bot portal for now, but keep that token handy!
 - Discord Config
     1. Fill out the `DiscordToken` with your discord app/bot's token
   1. Fill out `DiscordBroadcastChannel` with the channel ID where the bot posts AP info and accepts player commands
-    1. Fill out `DiscordAlertUserID` with your User ID. (This can also be a group/role in discord)
+    1. Fill out `DiscordAlertUserID` with your own Discord user ID. The bot mentions that user in debug-channel error alerts. To mention a role instead, enter `&` followed by the role ID; any other value is logged and not mentioned.
     1. Fill out `DiscordDebugChannel` with the channel ID for admin/debug alerts. Use the same ID as `DiscordBroadcastChannel` to keep commands and all channel notifications together, or choose a separate debug channel. The bot needs permission to view and send messages in each configured channel, and attach files in the broadcast channel for charts.
 - Archipelago Config
   1. Fill out `ArchipelagoServer` if you're self-hosting the Archipelago Server
@@ -97,6 +97,7 @@ You're done with the bot portal for now, but keep that token handy!
 - Notification Config (optional)
   1. `ConnectionUnavailableMessage` and `ConnectionRestoredMessage` customize notices sent after a prolonged room disconnect and after recovery. The built-in defaults are plain text.
   1. Use `{room_url}` for the room URL (the bot supplies `<` and `>` around it to suppress Discord embeds) and `{server_address}` for the plain `host:port` value. Other text, including emoji, is sent as written. Missing, malformed, empty, or non-string values fall back to the built-in messages.
+  1. `HintMessage` (see [Hint result notifications](hint-notifications.md)) replaces the complete hint result announcement. Placeholders: `{receiver}`, `{item}`, `{location}`, `{finder}`, `{status}`, `{entrance}`. Result posts never ping anyone and are capped at Discord's 2000-character limit. The built-in fallback is plain text without any emoji; emoji prefixes in the shipped `config.json.template` are examples, not defaults.
 
 You're free to leave the Advanced Config section as-is unless you know what you're doing.  
 Detailed references for the `config.json` can be found on the main [Readme](/README.md)
@@ -145,6 +146,8 @@ This process will automatically create new directories, and reload all data need
 It's a fairly painless process, but should be done carefully and in order, as to not break Bridgeipelago into a thousand pieces.
 
 **(Make sure the room is up, and connectable by clients before you $reloadtracker!)**
+
+These commands require **Administrator** or **Manage Server** permission in the server. Passwords are never echoed back to the channel.
 
 1. `$setconfig ArchipelagoPort <port>`  
     - Sets the port

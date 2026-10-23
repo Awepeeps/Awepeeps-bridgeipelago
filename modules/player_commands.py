@@ -1,6 +1,9 @@
 """Player-facing Discord slash commands, independent from bot startup/config."""
 
 from discord import app_commands
+import discord
+
+HINT_FIELD_MAX_LENGTH = 100
 
 
 def register_player_commands(tree, callbacks, get_broadcast_channel_id):
@@ -28,6 +31,12 @@ def register_player_commands(tree, callbacks, get_broadcast_channel_id):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             result = await work()
+            if result is False:
+                await interaction.followup.send(
+                    "The command could not be completed. Please check your DM settings or try again later.",
+                    ephemeral=True,
+                )
+                return
             await interaction.followup.send(
                 result if message is None else message, ephemeral=True
             )
@@ -44,6 +53,13 @@ def register_player_commands(tree, callbacks, get_broadcast_channel_id):
 
     @command("register", "Register your Discord account for an AP slot")
     async def register_command(interaction, slot: str):
+        if not await check_channel(interaction):
+            return
+        if not slot.strip():
+            await interaction.response.send_message(
+                "Use `/register` with the exact slot name from Archipelago.", ephemeral=True
+            )
+            return
         await run_deferred(
             interaction,
             lambda: callbacks["register"](str(interaction.user), slot),
@@ -106,8 +122,17 @@ def register_player_commands(tree, callbacks, get_broadcast_channel_id):
                 "Both slot and item are required.", ephemeral=True
             )
             return
+        if len(slot) > HINT_FIELD_MAX_LENGTH or len(item) > HINT_FIELD_MAX_LENGTH:
+            await interaction.response.send_message(
+                "Slot and item must each be {} characters or fewer.".format(HINT_FIELD_MAX_LENGTH),
+                ephemeral=True,
+            )
+            return
         callbacks["hint_queue"]().put([slot, item])
-        await interaction.response.send_message("Your hint request was queued.", ephemeral=True)
+        await interaction.response.send_message(
+            str(interaction.user) + " requested a hint for " + slot + ": " + item,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
 
     @command("checkcount", "Post the check count")
     async def checkcount_command(interaction):

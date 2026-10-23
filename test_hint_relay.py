@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 import ast
@@ -6,12 +7,30 @@ import threading
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from modules.hint_relay import (
-    HintRelayState, format_hint_status, hint_identity, hint_subscription_keys,
-    normalize_requested_hint,
+    HintRelayState, MAX_DISCORD_TEXT_LENGTH, deliver_pending_hints,
+    format_hint_status, hint_identity, hint_subscription_keys,
+    normalize_requested_hint, render_hint_message, unused_corrupt_path,
 )
+
+
+class FakeClock:
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class FakeHTTPError(Exception):
+    def __init__(self, status):
+        super().__init__("rejected")
+        self.status = status
 
 
 def hint(**updates):
@@ -93,20 +112,32 @@ class HintRelayTests(unittest.TestCase):
         state.observe_snapshot("store", [item])
         self.assertTrue(state.enqueue_requested(item))
         self.assertFalse(state.enqueue_requested(dict(item, status=40, found=True)))
-        state.deliver_pending(lambda delivered: None)
+
+        async def deliver(_):
+            return None
+
+        asyncio.run(deliver_pending_hints(state, deliver))
         self.assertFalse(state.enqueue_requested(item))
 
-    def test_delivery_failure_remains_pending_and_retry_acknowledges(self):
-        state = HintRelayState(self.path)
+    def test_transient_delivery_failure_stays_pending_until_backoff_then_retries(self):
+        clock = FakeClock()
+        state = HintRelayState(self.path, clock=clock)
         item = hint()
         state.observe_snapshot("store", [item])
         state.observe_snapshot("store", [item, hint(location=43)])
-        def fail(_):
+
+        async def fail(_):
             raise RuntimeError("discord unavailable")
-        with self.assertRaises(RuntimeError):
-            state.deliver_pending(fail)
+
+        self.assertEqual(asyncio.run(deliver_pending_hints(state, fail)), 0)
         self.assertEqual(len(state.pending_items()), 1)
-        state.deliver_pending(lambda _: None)
+        self.assertEqual(len(state.due_pending_items()), 0)
+        clock.advance(3600)
+
+        async def succeed(_):
+            return None
+
+        self.assertEqual(asyncio.run(deliver_pending_hints(state, succeed)), 1)
         self.assertEqual(state.pending_items(), [])
         reloaded = HintRelayState(self.path)
         self.assertEqual(reloaded.data["announced"], [hint_identity(hint(location=43))])
@@ -118,13 +149,48 @@ class HintRelayTests(unittest.TestCase):
         self.assertEqual(state.observe_snapshot("store", [hint()]), 0)
         self.assertEqual(state.pending_items(), [])
 
+    def test_corrupt_state_is_moved_aside_before_the_first_write(self):
+        Path(self.path).write_text("{broken", encoding="utf-8")
+        state = HintRelayState(self.path)
+        self.assertEqual(state.corrupt_backup, self.path + ".corrupt")
+        self.assertEqual(state.observe_snapshot("store", [hint()]), 0)
+        self.assertEqual(Path(self.path + ".corrupt").read_text(encoding="utf-8"), "{broken")
+        self.assertIn("store", json.loads(Path(self.path).read_text(encoding="utf-8"))["snapshots"])
+
+    def test_earlier_corrupt_copies_are_not_overwritten(self):
+        Path(self.path + ".corrupt").write_text("earlier copy", encoding="utf-8")
+        Path(self.path).write_text("{broken", encoding="utf-8")
+        state = HintRelayState(self.path)
+        self.assertEqual(state.corrupt_backup, self.path + ".corrupt.1")
+        self.assertEqual(Path(self.path + ".corrupt").read_text(encoding="utf-8"), "earlier copy")
+        self.assertEqual(Path(self.path + ".corrupt.1").read_text(encoding="utf-8"), "{broken")
+
+    def test_unmovable_corrupt_state_blocks_writes_instead_of_overwriting(self):
+        Path(self.path).write_text("{broken", encoding="utf-8")
+        with patch("modules.hint_relay.os.replace", side_effect=OSError("file in use")):
+            state = HintRelayState(self.path)
+            with self.assertRaises(OSError):
+                state.observe_snapshot("store", [hint()])
+        self.assertEqual(Path(self.path).read_text(encoding="utf-8"), "{broken")
+        self.assertIsNone(state.corrupt_backup)
+        self.assertIn("file in use", state.corrupt_error)
+        # The move is retried before the next write, which then succeeds.
+        self.assertEqual(state.observe_snapshot("store", [hint()]), 0)
+        self.assertEqual(Path(self.path + ".corrupt").read_text(encoding="utf-8"), "{broken")
+
+    def test_unused_corrupt_path_numbers_past_existing_copies(self):
+        base = str(Path(self.temp.name) / "relay.json")
+        self.assertEqual(unused_corrupt_path(base), base + ".corrupt")
+        Path(base + ".corrupt").write_text("a", encoding="utf-8")
+        Path(base + ".corrupt.1").write_text("b", encoding="utf-8")
+        self.assertEqual(unused_corrupt_path(base), base + ".corrupt.2")
+
     def test_status_mapping_keeps_unknown_status_readable(self):
         self.assertEqual(format_hint_status(30), "Priority")
         self.assertEqual(format_hint_status(997), "Status 997")
         self.assertEqual(format_hint_status(None, True), "Found")
 
     def test_template_uses_literal_placeholders_and_sanitizes_mentions(self):
-        from modules.hint_relay import render_hint_message
         text = render_hint_message(
             "✨ {receiver}: {item} at {location} {entrance}", "plain",
             {"receiver": "@everyone", "item": "A {location}", "location": "Cave", "entrance": ""},
@@ -133,6 +199,11 @@ class HintRelayTests(unittest.TestCase):
         self.assertEqual(render_hint_message("  ", "plain {receiver}", {"receiver": "A"}), "plain A")
         self.assertEqual(render_hint_message(7, "plain {receiver}", {"receiver": "A"}), "plain A")
 
+    def test_rendered_discord_text_is_capped_at_2000_characters(self):
+        text = render_hint_message("x" * 5000, "fallback", {})
+        self.assertEqual(len(text), MAX_DISCORD_TEXT_LENGTH)
+        self.assertEqual(len(render_hint_message("y" * 2000, "fallback", {})), 2000)
+
     def test_real_shaped_hint_identity_ignores_found_and_status(self):
         record = {
             "receiving_player": 2, "finding_player": 1, "location": 42,
@@ -140,6 +211,244 @@ class HintRelayTests(unittest.TestCase):
             "item_flags": 1, "status": 30, "team": 0,
         }
         self.assertEqual(hint_identity(record), hint_identity(dict(record, found=True, status=40)))
+
+    def test_permanent_http_400_and_403_deadletter_without_blocking_good_items(self):
+        for status in (400, 403):
+            with self.subTest(status=status):
+                path = str(Path(self.temp.name) / "relay-{}.json".format(status))
+                state = HintRelayState(path)
+                bad = hint(location=1)
+                good = hint(location=2)
+                state.enqueue_requested(bad)
+                state.enqueue_requested(good)
+                sent = []
+                logs = []
+
+                async def send(item):
+                    if item["location"] == 1:
+                        raise FakeHTTPError(status)
+                    sent.append(item["location"])
+
+                delivered = asyncio.run(deliver_pending_hints(state, send, log=logs.append))
+                self.assertEqual(delivered, 1)
+                self.assertEqual(sent, [2])
+                dead = dict(state.deadletter_items())
+                self.assertIn(hint_identity(bad), dead)
+                self.assertEqual(dead[hint_identity(bad)]["reason"], "http_{}".format(status))
+                self.assertEqual(dead[hint_identity(bad)]["attempts"], 1)
+                self.assertNotIn("entrance", dead[hint_identity(bad)])
+                self.assertNotIn("item", dead[hint_identity(bad)])
+                self.assertEqual(state.pending_items(), [])
+                self.assertEqual(len(logs), 1)
+                self.assertIn("HTTP {}".format(status), logs[0])
+                # Logs must not leak the rendered hint or its payload.
+                self.assertNotIn("Entrance", logs[0])
+                self.assertNotIn("Hint result", logs[0])
+
+    def test_transient_backoff_persists_and_recovers_after_restart(self):
+        clock = FakeClock(1000.0)
+        options = dict(
+            clock=clock, max_attempts=3,
+            retry_base_seconds=5.0, retry_max_seconds=60.0,
+        )
+        state = HintRelayState(self.path, **options)
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+        calls = []
+
+        async def fail(_):
+            calls.append("fail")
+            raise RuntimeError("temporary")
+
+        self.assertEqual(asyncio.run(deliver_pending_hints(state, fail)), 0)
+        self.assertEqual(calls, ["fail"])
+        retry = state.data["retries"][identity]
+        self.assertEqual(retry["attempts"], 1)
+        self.assertEqual(retry["next_attempt"], 1005.0)
+
+        restarted = HintRelayState(self.path, **options)
+        self.assertEqual(restarted.due_pending_items(), [])
+        self.assertEqual(asyncio.run(deliver_pending_hints(restarted, fail)), 0)
+        self.assertEqual(calls, ["fail"])
+
+        clock.advance(5.0)
+        sent = []
+
+        async def succeed(delivered):
+            sent.append(delivered)
+
+        self.assertEqual(asyncio.run(deliver_pending_hints(restarted, succeed)), 1)
+        self.assertEqual(sent, [item])
+        self.assertEqual(restarted.pending_items(), [])
+        self.assertEqual(restarted.data["retries"], {})
+
+        reloaded = HintRelayState(self.path, **options)
+        self.assertIn(identity, reloaded.data["announced"])
+
+    def test_repeated_transient_failures_deadletter_after_bounded_attempts(self):
+        clock = FakeClock(0.0)
+        state = HintRelayState(
+            self.path, clock=clock, max_attempts=3,
+            retry_base_seconds=1.0, retry_max_seconds=2.0,
+        )
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+
+        async def fail(_):
+            raise RuntimeError("still unavailable")
+
+        for expected in (1, 2):
+            asyncio.run(deliver_pending_hints(state, fail))
+            self.assertEqual(state.data["retries"][identity]["attempts"], expected)
+            clock.advance(10.0)
+        self.assertEqual(asyncio.run(deliver_pending_hints(state, fail)), 0)
+        self.assertEqual(state.pending_items(), [])
+        dead = dict(state.deadletter_items())[identity]
+        self.assertEqual(dead["attempts"], 3)
+        self.assertEqual(dead["reason"], "retry_limit")
+
+    def test_default_retry_window_deadletters_after_eleven_attempts_over_eighteen_minutes(self):
+        clock = FakeClock(0.0)
+        state = HintRelayState(self.path, clock=clock)
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+        sends = []
+
+        async def fail(_):
+            sends.append(clock.now)
+            raise RuntimeError("unavailable")
+
+        self.assertEqual((state.max_attempts, state.retry_max_seconds), (11, 300.0))
+        for _ in range(state.max_attempts + 2):
+            asyncio.run(deliver_pending_hints(state, fail))
+            if not state.pending_items():
+                break
+            clock.now = state.data["retries"][identity]["next_attempt"]
+        self.assertEqual(len(sends), 11)
+        gaps = [later - earlier for earlier, later in zip(sends, sends[1:])]
+        self.assertEqual(gaps, [2, 4, 8, 16, 32, 64, 128, 256, 300, 300])
+        self.assertEqual(sends[-1] - sends[0], 1110)
+        dead = dict(state.deadletter_items())[identity]
+        self.assertEqual((dead["attempts"], dead["reason"]), (11, "retry_limit"))
+
+    def test_unpersisted_acknowledgment_is_retried_without_resending_in_this_process(self):
+        state = HintRelayState(self.path)
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+        sends = []
+
+        async def send(delivered):
+            sends.append(delivered)
+
+        with patch.object(state, "_save_data", side_effect=OSError("disk full")):
+            self.assertEqual(asyncio.run(deliver_pending_hints(state, send)), 0)
+            self.assertEqual(asyncio.run(deliver_pending_hints(state, send)), 0)
+            # A restart cannot know the acknowledgment was lost, so the result stays pending on disk.
+            self.assertEqual(HintRelayState(self.path).pending_items(), [(identity, item)])
+        self.assertEqual(sends, [item])
+        self.assertEqual(state.pending_items(), [(identity, item)])
+
+        self.assertEqual(asyncio.run(deliver_pending_hints(state, send)), 1)
+        self.assertEqual(sends, [item])
+        self.assertEqual(state.pending_items(), [])
+        self.assertIn(identity, HintRelayState(self.path).data["announced"])
+
+    def test_failed_retry_write_still_backs_off_in_this_process(self):
+        clock = FakeClock(1000.0)
+        state = HintRelayState(self.path, clock=clock)
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+        calls = []
+
+        async def fail(_):
+            calls.append("fail")
+            raise RuntimeError("temporary")
+
+        with patch.object(state, "_save_data", side_effect=OSError("disk full")):
+            self.assertEqual(asyncio.run(deliver_pending_hints(state, fail)), 0)
+            self.assertEqual(asyncio.run(deliver_pending_hints(state, fail)), 0)
+        self.assertEqual(calls, ["fail"])
+        self.assertEqual(state.data["retries"][identity]["attempts"], 1)
+        self.assertEqual(state.data["retries"][identity]["next_attempt"], 1002.0)
+
+        clock.advance(2.0)
+        self.assertEqual(asyncio.run(deliver_pending_hints(state, fail)), 0)
+        self.assertEqual(calls, ["fail", "fail"])
+
+    def test_failed_deadletter_write_is_not_retried_in_this_process(self):
+        state = HintRelayState(self.path)
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+        calls = []
+
+        async def reject(_):
+            calls.append("reject")
+            raise FakeHTTPError(400)
+
+        with patch.object(state, "_save_data", side_effect=OSError("disk full")):
+            asyncio.run(deliver_pending_hints(state, reject))
+            asyncio.run(deliver_pending_hints(state, reject))
+        self.assertEqual(calls, ["reject"])
+        self.assertEqual(state.pending_items(), [])
+        self.assertIn(identity, dict(state.deadletter_items()))
+
+    def test_delivery_issue_logs_are_throttled_between_backoff_attempts(self):
+        clock = FakeClock(0.0)
+        state = HintRelayState(
+            self.path, clock=clock, max_attempts=50,
+            retry_base_seconds=0.0, retry_max_seconds=0.0,
+            log_interval_seconds=60.0,
+        )
+        state.enqueue_requested(hint())
+        logs = []
+
+        async def fail(_):
+            raise RuntimeError("temporary")
+
+        asyncio.run(deliver_pending_hints(state, fail, log=logs.append))
+        asyncio.run(deliver_pending_hints(state, fail, log=logs.append))
+        self.assertEqual(len(logs), 1)
+        clock.advance(61.0)
+        asyncio.run(deliver_pending_hints(state, fail, log=logs.append))
+        self.assertEqual(len(logs), 2)
+
+    def test_failed_state_write_does_not_drop_pending_in_memory(self):
+        state = HintRelayState(self.path)
+        item = hint()
+        state.enqueue_requested(item)
+        identity = hint_identity(item)
+        before = json.loads(json.dumps(state.data))
+
+        with patch.object(state, "_save_data", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                state.mark_delivered(identity)
+            with self.assertRaises(OSError):
+                state.observe_snapshot("store", [hint(location=50)])
+
+        self.assertEqual(state.pending_items(), [(identity, item)])
+        self.assertEqual(state.data, before)
+        self.assertEqual(HintRelayState(self.path).pending_items(), [(identity, item)])
+
+    def test_legacy_v1_state_without_delivery_metadata_loads_and_retries(self):
+        item = hint()
+        legacy = {
+            "version": 1,
+            "snapshots": {},
+            "announced": [],
+            "pending": {hint_identity(item): item},
+        }
+        Path(self.path).write_text(json.dumps(legacy), encoding="utf-8")
+        state = HintRelayState(self.path)
+        self.assertFalse(state.corrupt)
+        self.assertEqual(state.data["retries"], {})
+        self.assertEqual(state.data["dead"], {})
+        self.assertEqual(len(state.due_pending_items()), 1)
 
 
 def load_tracker_client():
@@ -198,6 +507,17 @@ def load_hint_client(relay_config):
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "bridgeipelago.py", "exec"), namespace)
     return namespace["HintClient"], namespace
+
+
+def load_bridge_functions(names, namespace):
+    tree = ast.parse((Path(__file__).resolve().parent / "bridgeipelago.py").read_text(encoding="utf-8"))
+    body = []
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names:
+            node.decorator_list = []
+            body.append(node)
+    exec(compile(ast.Module(body=body, type_ignores=[]), "bridgeipelago.py", "exec"), namespace)
+    return namespace
 
 
 class TrackerHintProtocolTests(unittest.TestCase):
@@ -271,6 +591,54 @@ class TrackerHintProtocolTests(unittest.TestCase):
         state.observe_snapshot(key, messages[0]["data"]["hints"])
         self.assertEqual(state.observe_snapshot(key, messages[1]["data"]["hints"]), 1)
 
+    def test_null_retrieved_store_is_an_empty_baseline_then_setreply_announces(self):
+        key = "_read_hints_0_1"
+        new = self.hint_dict(43)
+        ns, client = self.run_protocol([
+            self.connected(),
+            {"cmd": "Retrieved", "keys": {key: None}},
+            {"cmd": "SetReply", "key": key, "value": [new]},
+        ])
+        messages = ns["chat_queue"].messages
+        self.assertEqual([message["data"]["hints"] for message in messages], [
+            [], [dict(new, team=0)],
+        ])
+        self.assertNotIn(key, client.hint_baseline_keys)
+        state = HintRelayState(self.path)
+        self.assertEqual(state.observe_snapshot(key, messages[0]["data"]["hints"]), 0)
+        self.assertEqual(state.observe_snapshot(key, messages[1]["data"]["hints"]), 1)
+
+    def test_retrieved_does_not_baseline_unsubscribed_keys(self):
+        key = "_read_hints_0_1"
+        ns, client = self.run_protocol([
+            self.connected(),
+            {"cmd": "Retrieved", "keys": {
+                "_read_hints_9_9": None,
+                key: None,
+            }},
+        ])
+        messages = ns["chat_queue"].messages
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["data"]["key"], key)
+        self.assertEqual(messages[0]["data"]["hints"], [])
+        self.assertNotIn(key, client.hint_baseline_keys)
+        self.assertNotIn("_read_hints_9_9", client.hint_baseline_keys)
+
+    def test_prebaseline_setreply_buffer_is_bounded_and_keeps_newest(self):
+        key = "_read_hints_0_1"
+        old = self.hint_dict()
+        packets = [self.connected()]
+        for location in range(100, 120):
+            packets.append({"cmd": "SetReply", "key": key, "value": [self.hint_dict(location)]})
+        packets.append({"cmd": "Retrieved", "keys": {key: [old]}})
+        ns, client = self.run_protocol(packets)
+        messages = ns["chat_queue"].messages
+        limit = client.HINT_PREBASELINE_REPLY_LIMIT
+        self.assertEqual(len(messages), 1 + limit)
+        self.assertEqual(messages[0]["data"]["hints"], [dict(old, team=0)])
+        replayed = [message["data"]["hints"][0]["location"] for message in messages[1:]]
+        self.assertEqual(replayed, list(range(120 - limit, 120)))
+
     def test_missing_hint_flag_keeps_tracker_subscription_disabled(self):
         ns, client = self.run_protocol([self.connected()], relay_config={})
         client.ap_connection.send.assert_not_called()
@@ -308,6 +676,83 @@ class TrackerHintProtocolTests(unittest.TestCase):
         client.ap_connection.recv = Mock(side_effect=lambda timeout=None: (client.is_closed.set(), json.dumps([connected, hint_message, command_result]))[1])
         client.run()
         self.assertEqual([message["type"] for message in ns["chat_queue"].messages], ["HTMessage", "HTMessage"])
+
+
+class HintRelayStartupAndQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = str(Path(self.temp.name) / "relay.json")
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def test_initialize_helper_loads_durable_pending_once(self):
+        state = HintRelayState(self.path)
+        state.enqueue_requested(hint())
+        namespace = {
+            "HintRelayState": HintRelayState,
+            "GetCoreFiles": lambda _: self.path,
+            "HintRelayStateInstance": None,
+        }
+        load_bridge_functions({"InitializeHintRelayState"}, namespace)
+        instance = asyncio.run(namespace["InitializeHintRelayState"]())
+        self.assertIsNotNone(instance)
+        self.assertEqual(len(instance.pending_items()), 1)
+        self.assertEqual(instance.pending_items()[0][0], hint_identity(hint()))
+        self.assertIs(instance, namespace["HintRelayStateInstance"])
+        self.assertIs(asyncio.run(namespace["InitializeHintRelayState"]()), instance)
+
+    def test_bad_hint_does_not_block_normal_chat_or_spam_debug(self):
+        state = HintRelayState(self.path)
+        bad = hint(location=7)
+        state.enqueue_requested(bad)
+        sent = []
+        debug = []
+        logs = []
+
+        class FakeQueue:
+            def __init__(self, items):
+                self.items = list(items)
+            def empty(self):
+                return not self.items
+            def get(self):
+                return self.items.pop(0)
+
+        async def send_hint(_):
+            raise FakeHTTPError(400)
+
+        async def send_main(text):
+            sent.append(text)
+
+        async def send_debug(text):
+            debug.append(text)
+
+        namespace = {
+            "CoreConfig": {"RelayConfig": {"HintMessages": True}},
+            "HintRelayStateInstance": state,
+            "chat_queue": FakeQueue([
+                {"type": "CORE", "data": {"text": "normal chat"}, "flag": "None"},
+            ]),
+            "HandleHintRelayMessage": Mock(),
+            "SendMainChannelMessage": send_main,
+            "SendDebugChannelMessage": send_debug,
+            "WriteToErrorLog": lambda module, message: None,
+            "SendHintResult": send_hint,
+            "deliver_pending_hints": deliver_pending_hints,
+            "ReportHintRelayDeliveryIssue": logs.append,
+            "HintRelayState": HintRelayState,
+            "GetCoreFiles": lambda _: self.path,
+        }
+        load_bridge_functions(
+            {"InitializeHintRelayState", "DeliverPendingHintResults", "ProcessChatQueue"},
+            namespace,
+        )
+        asyncio.run(namespace["ProcessChatQueue"]())
+        self.assertEqual(sent, ["normal chat"])
+        self.assertEqual(debug, [])
+        self.assertEqual(len(state.deadletter_items()), 1)
+        self.assertEqual(len(logs), 1)
+        self.assertIn("HTTP 400", logs[0])
 
 
 if __name__ == "__main__":

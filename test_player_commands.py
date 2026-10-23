@@ -25,7 +25,7 @@ class FakeResponse:
         self.deferred = []
         self.responded = False
 
-    async def send_message(self, content, ephemeral=False):
+    async def send_message(self, content, ephemeral=False, **kwargs):
         if self.responded:
             raise RuntimeError("interaction already acknowledged")
         self.responded = True
@@ -42,7 +42,7 @@ class FakeFollowup:
     def __init__(self):
         self.messages = []
 
-    async def send(self, content, ephemeral=False):
+    async def send(self, content, ephemeral=False, **kwargs):
         self.messages.append((content, ephemeral))
 
 
@@ -133,6 +133,17 @@ class PlayerCommandTests(unittest.TestCase):
         self.assertEqual(interaction.response.deferred, [(True, True)])
         self.assertTrue(interaction.followup.messages[0][1])
 
+    def test_blank_register_slot_gets_usage_and_registers_nothing(self):
+        for slot in ("", "   "):
+            with self.subTest(slot=slot):
+                self.calls.clear()
+                interaction = self.call("register", slot)
+                self.assertEqual(self.calls, [])
+                self.assertEqual(
+                    interaction.response.messages,
+                    [("Use `/register` with the exact slot name from Archipelago.", True)],
+                )
+
     def test_dm_commands_reuse_the_existing_callbacks(self):
         listreg = self.call("listreg")
         self.assertEqual(self.calls[-1], ("listreg", (listreg.user,)))
@@ -165,6 +176,17 @@ class PlayerCommandTests(unittest.TestCase):
             self.assertEqual(self.calls[-1], (name, ()))
             self.assertTrue(interaction.response.deferred[0][0])
             self.assertTrue(interaction.followup.messages[0][1])
+
+    def test_failed_callbacks_do_not_report_success(self):
+        async def fail(*args):
+            return False
+        for name in ("listreg", "ketchmeup", "groupcheck", "hints", "checkcount", "checkgraph", "deathcount"):
+            with self.subTest(command=name):
+                self.callbacks[name] = fail
+                args = ("Slot A",) if name == "groupcheck" else ()
+                interaction = self.call(name, *args)
+                self.assertIn("could not be completed", interaction.followup.messages[0][0])
+                self.assertTrue(interaction.followup.messages[0][1])
 
     def test_deferred_callback_errors_get_private_followup(self):
         async def fail(*args):

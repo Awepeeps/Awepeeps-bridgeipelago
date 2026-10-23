@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import discord
 
 from modules.hint_relay import unused_corrupt_path
-from modules.player_commands import HINT_FIELD_MAX_LENGTH, register_player_commands
+from modules.player_commands import HINT_FIELD_MAX_LENGTH, HINT_NOT_REGISTERED_MESSAGE, register_player_commands
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ast.parse((ROOT / "bridgeipelago.py").read_text(encoding="utf-8"))
@@ -86,6 +86,8 @@ def load_on_message():
         "hint_queue": Mock(),
         "HelpText": "help",
         "HINT_FIELD_MAX_LENGTH": HINT_FIELD_MAX_LENGTH,
+        "HINT_NOT_REGISTERED_MESSAGE": HINT_NOT_REGISTERED_MESSAGE,
+        "CanRequestHint": Mock(return_value=True),
     }
     namespace.update({name: AsyncMock() for name in COMMAND_NAMES})
     return load(["on_message"], namespace, optional=["IsBotAdmin"])
@@ -134,12 +136,27 @@ class TextHintTests(unittest.TestCase):
         return ns
 
     def test_text_hint_with_empty_slot_or_item_gets_usage_reply(self):
-        for content in ("$hint |x", "$hint Slot A |", "$hint |", "$hint "):
+        for content in ("$hint |x", "$hint Slot A |", "$hint |", "$hint ", "$hint", "$hint Slot A"):
             with self.subTest(content=content):
                 ns = self.run_as(content)
                 ns["hint_queue"].put.assert_not_called()
                 ns["SendMainChannelMessage"].assert_awaited_once_with(
                     "Invalid $hint format. Use `$hint <slot>|<item>`")
+
+    def test_text_hint_for_an_unregistered_slot_is_refused(self):
+        ns = load_on_message()
+        ns["CanRequestHint"].return_value = False
+        author = fake_member()
+        asyncio.run(ns["on_message"](fake_message("$hint Slot A | Item B", author)))
+        ns["CanRequestHint"].assert_called_once_with(author, "Slot A")
+        ns["hint_queue"].put.assert_not_called()
+        ns["SendMainChannelMessage"].assert_awaited_once_with(HINT_NOT_REGISTERED_MESSAGE)
+
+    def test_hints_list_command_is_not_parsed_as_a_hint_request(self):
+        ns = self.run_as("$hints")
+        ns["hint_queue"].put.assert_not_called()
+        ns["Command_Hints"].assert_awaited_once()
+        ns["SendMainChannelMessage"].assert_not_awaited()
 
     def test_text_hint_with_slot_and_item_is_queued(self):
         # Positive control for the empty-field checks above.
@@ -157,6 +174,46 @@ class TextHintTests(unittest.TestCase):
     def test_text_hint_accepts_exactly_100_characters(self):
         ns = self.run_as("$hint " + "S" * 100 + " | " + "I" * 100)
         ns["hint_queue"].put.assert_called_once_with(["S" * 100, "I" * 100])
+
+
+class CanRequestHintTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.ns = load(["CanRequestHint", "IsBotAdmin"], {
+            "GetCoreDirectory": lambda folder: self.directory.name + "/",
+            "json": json,
+        })
+
+    def write_registrations(self, contents):
+        # Registration files are named after str(author), as Command_Register stores them.
+        with open(os.path.join(self.directory.name, str(self.member) + ".json"), "w") as output:
+            output.write(contents)
+
+    @property
+    def member(self):
+        if not hasattr(self, "_member"):
+            self._member = FakeUser("Player")
+            self._member.guild_permissions = SimpleNamespace(administrator=False, manage_guild=False)
+        return self._member
+
+    def test_registered_slot_matches_ignoring_case_and_spaces(self):
+        self.write_registrations(json.dumps([" Slot A "]))
+        self.assertTrue(self.ns["CanRequestHint"](self.member, "slot a"))
+
+    def test_other_slots_are_refused(self):
+        self.write_registrations(json.dumps(["Slot A"]))
+        self.assertFalse(self.ns["CanRequestHint"](self.member, "Slot B"))
+
+    def test_unregistered_or_unreadable_users_are_refused(self):
+        self.assertFalse(self.ns["CanRequestHint"](self.member, "Slot A"))
+        for contents in ("not json", json.dumps({"Slot A": 1})):
+            with self.subTest(contents=contents):
+                self.write_registrations(contents)
+                self.assertFalse(self.ns["CanRequestHint"](self.member, "Slot A"))
+
+    def test_admins_can_request_any_slot(self):
+        self.assertTrue(self.ns["CanRequestHint"](fake_member(manage_guild=True), "Slot B"))
 
 
 class RegisterCommandInputTests(unittest.TestCase):
@@ -608,7 +665,7 @@ class QueueSafetyTests(unittest.TestCase):
         self.assertIs(self.run_command("Command_KetchMeUp", denied, "$ketchmeup"), False)
 
 
-def load_hint_tree():
+def load_hint_tree(can_hint=True):
     class FakeTree:
         def __init__(self):
             self.commands = {}
@@ -628,6 +685,7 @@ def load_hint_tree():
     )}
     hint_queue = queue.Queue()
     callbacks["hint_queue"] = lambda: hint_queue
+    callbacks["can_hint"] = lambda user, slot: can_hint
     tree = FakeTree()
     register_player_commands(tree, callbacks, lambda: 42)
     return tree, hint_queue
@@ -667,6 +725,13 @@ class SlashHintTests(unittest.TestCase):
                 content, ephemeral = interaction.response.messages[0]
                 self.assertTrue(ephemeral)
                 self.assertIn("100 characters", content)
+        self.assertTrue(hint_queue.empty())
+
+    def test_hint_request_for_an_unregistered_slot_is_refused_privately(self):
+        tree, hint_queue = load_hint_tree(can_hint=False)
+        interaction = SimpleNamespace(channel_id=42, user=FakeUser(), response=FakeHintResponse())
+        asyncio.run(tree.commands["hint"](interaction, "Slot A", "Item B"))
+        self.assertEqual(interaction.response.messages, [(HINT_NOT_REGISTERED_MESSAGE, True)])
         self.assertTrue(hint_queue.empty())
 
     def test_hint_request_accepts_exactly_100_characters(self):

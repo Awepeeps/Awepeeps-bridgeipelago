@@ -49,7 +49,7 @@ from bs4 import BeautifulSoup
 from discord.ext import tasks
 import discord
 from discord import app_commands
-from modules.player_commands import HINT_FIELD_MAX_LENGTH, register_player_commands
+from modules.player_commands import HINT_FIELD_MAX_LENGTH, HINT_NOT_REGISTERED_MESSAGE, register_player_commands
 from modules.daily_post import (
     DailyPostConfigError,
     DailyPostState,
@@ -879,7 +879,7 @@ HelpText = """**Archipelago bot commands** (only work in this channel, lowercase
 `$hints` - hinted items for your registered slots
 
 **Hints & progress**
-`$hint <slot> | <item>` - request a hint, posted here
+`$hint <slot> | <item>` - request a hint for a slot you're registered for, posted here
 `$checkcount` - check counts for everyone
 `$checkgraph` - progress graph
 `$deathcount` - DeathLink tally
@@ -893,6 +893,22 @@ def IsBotAdmin(author):
     if permissions is None:
         return False
     return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
+
+def CanRequestHint(author, slot):
+    # A hint spends the slot's own hint points, so only people registered to
+    # that slot (or bot admins) may ask for one.
+    if IsBotAdmin(author):
+        return True
+    RegistrationFile = GetCoreDirectory("reg") + str(author) + ".json"
+    try:
+        with open(RegistrationFile, "r") as RegistrationInput:
+            RegisteredSlots = json.load(RegistrationInput)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(RegisteredSlots, list):
+        return False
+    WantedSlot = str(slot).strip().lower()
+    return any(str(RegisteredSlot).strip().lower() == WantedSlot for RegisteredSlot in RegisteredSlots)
 
 @discord_client.event
 async def on_message(message):
@@ -939,12 +955,15 @@ async def on_message(message):
     if message.content.startswith('$hints'):
         await Command_Hints(message.author)
     
-    if message.content.startswith('$hint '):
-        hintrequest = [item.strip() for item in ((message.content).split('$hint '))[1].split('|')]
+    HintParts = message.content.split(None, 1)
+    if HintParts and HintParts[0] == '$hint':
+        hintrequest = [item.strip() for item in (HintParts[1] if len(HintParts) > 1 else "").split('|')]
         if not(len(hintrequest)==2 and all(hintrequest)):
             await SendMainChannelMessage("Invalid $hint format. Use `$hint <slot>|<item>`")
         elif any(len(field) > HINT_FIELD_MAX_LENGTH for field in hintrequest):
             await SendMainChannelMessage("Slot and item must each be {} characters or fewer.".format(HINT_FIELD_MAX_LENGTH))
+        elif not CanRequestHint(message.author, hintrequest[0]):
+            await SendMainChannelMessage(HINT_NOT_REGISTERED_MESSAGE)
         else:
             hint_queue.put(hintrequest)
             await SendMainChannelMessage(str(message.author) + " requested a hint for " + hintrequest[0] + ": " + hintrequest[1])
@@ -2142,7 +2161,7 @@ PLAYER_COMMAND_NAMES = register_player_commands(
 /ketchmeup filter — DM missed items (0 all, 1 useful and progression, 2 progression)
 /groupcheck slot — DM queued items for a slot
 /hints — DM assigned hints
-/hint slot item — queue a hint request
+/hint slot item — request a hint for a slot you're registered for
 /checkcount — post check counts
 /checkgraph — post progress graph
 /deathcount — post DeathLink tally""",
@@ -2153,6 +2172,7 @@ PLAYER_COMMAND_NAMES = register_player_commands(
         "groupcheck": Command_GroupCheck,
         "hints": Command_Hints,
         "hint_queue": lambda: hint_queue,
+        "can_hint": CanRequestHint,
         "checkcount": Command_CheckCount,
         "checkgraph": Command_CheckGraph,
         "deathcount": Command_DeathCount,

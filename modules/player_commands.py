@@ -4,6 +4,10 @@ from discord import app_commands
 import discord
 
 HINT_FIELD_MAX_LENGTH = 100
+HINT_NOT_REGISTERED_MESSAGE = (
+    "You can only request hints for a slot you're registered for. "
+    "Use `$register <slot>` first."
+)
 
 
 def register_player_commands(tree, callbacks, get_broadcast_channel_id):
@@ -127,6 +131,9 @@ def register_player_commands(tree, callbacks, get_broadcast_channel_id):
                 "Slot and item must each be {} characters or fewer.".format(HINT_FIELD_MAX_LENGTH),
                 ephemeral=True,
             )
+            return
+        if not callbacks["can_hint"](interaction.user, slot):
+            await interaction.response.send_message(HINT_NOT_REGISTERED_MESSAGE, ephemeral=True)
             return
         callbacks["hint_queue"]().put([slot, item])
         await interaction.response.send_message(

@@ -75,6 +75,7 @@ class PlayerCommandTests(unittest.TestCase):
             "groupcheck": lambda *args: callback("groupcheck", *args),
             "hints": lambda *args: callback("hints", *args),
             "hint_queue": lambda: self.queue,
+            "can_hint": lambda user, slot: True,
             "checkcount": lambda *args: callback("checkcount", *args),
             "checkgraph": lambda *args: callback("checkgraph", *args),
             "deathcount": lambda *args: callback("deathcount", *args),
@@ -105,7 +106,7 @@ class PlayerCommandTests(unittest.TestCase):
         real_tree = app_commands.CommandTree(client)
         async def noop(*args):
             return None
-        callbacks = {"help_text": "help", "hint_queue": lambda: self.queue}
+        callbacks = {"help_text": "help", "hint_queue": lambda: self.queue, "can_hint": lambda user, slot: True}
         callbacks.update({
             name: noop for name in (
                 "register", "listreg", "clearreg", "ketchmeup", "groupcheck",

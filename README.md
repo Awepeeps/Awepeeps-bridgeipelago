@@ -101,7 +101,7 @@ and how channel posts differ from personal DMs, see [Item notification filters](
 ||\*Traps will only be sent if the filter is 0 AND BotItemSpoilTraps is enabled in the config|
 |`$groupcheck <slot>`|DMs the user all checks in the slot's ItemQueue file (the full stored queue, not a per-account position), used to catch up on group games|
 |`$hints`|DMs the hinted items for a player's registered slots|
-|`$hint <slot> \| <item>`|Allows you to request a hint from Archipelago and it'll be relayed to discord. The request is acknowledged publicly in the channel, naming you, with mentions suppressed. The slot and item are each limited to 100 characters, as with `/hint`|
+|`$hint <slot> \| <item>`|Allows you to request a hint from Archipelago and it'll be relayed to discord. The request is acknowledged publicly in the channel, naming you, with mentions suppressed. The slot and item are each limited to 100 characters, as with `/hint`. A hint spends that slot's hint points, so you can only request one for a slot you're registered to (server admins can request any slot); a bare `$hint` replies with the usage|
 |`$deathcount`|Scans the deathlog and tallies up the current deathcount for each slot|
 |`$checkcount`|Fetches the current Arch server's progress in simple txt format|
 |`$checkgraph`|Plots the current Arch progress in a picture|

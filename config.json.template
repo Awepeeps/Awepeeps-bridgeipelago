@@ -55,7 +55,12 @@
         "Time": "00:00",
         "Timezone": "America/New_York"
     },
+    "CommandConfig": {
+        "PrefixCommandsEnabled": true,
+        "SlashCommandsEnabled": true
+    },
     "NotificationConfig": {
+        "ItemMentionsEnabled": false,
         "ConnectionUnavailableMessage": "💤 The Archipelago room may be asleep. Open {room_url} to wake it up.",
         "ConnectionRestoredMessage": "☀️ The Archipelago room is reachable again at **{server_address}**.",
         "SleepWakeEditWindowMinutes": 15,

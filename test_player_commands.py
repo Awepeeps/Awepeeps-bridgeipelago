@@ -76,6 +76,7 @@ class PlayerCommandTests(unittest.TestCase):
             "hints": lambda *args: callback("hints", *args),
             "hint_queue": lambda: self.queue,
             "can_hint": lambda user, slot: True,
+            "is_registered_for_slot": lambda user, slot: True,
             "checkcount": lambda *args: callback("checkcount", *args),
             "checkgraph": lambda *args: callback("checkgraph", *args),
             "deathcount": lambda *args: callback("deathcount", *args),
@@ -87,10 +88,11 @@ class PlayerCommandTests(unittest.TestCase):
         asyncio.run(self.tree.commands[name](interaction, *args, **kwargs))
         return interaction
 
-    def test_registers_all_eleven_player_commands(self):
+    def test_registers_player_commands_including_notification_controls(self):
         expected = {
             "help", "register", "listreg", "clearreg", "ketchmeup", "groupcheck",
-            "hints", "hint", "checkcount", "checkgraph", "deathcount",
+            "hints", "hint", "checkcount", "checkgraph", "deathcount", "notify",
+            "watch", "unwatch", "watches",
         }
         self.assertEqual(set(self.registered), expected)
         self.assertEqual(set(self.tree.commands), expected)
@@ -170,6 +172,45 @@ class PlayerCommandTests(unittest.TestCase):
         self.assertTrue(self.queue.empty())
         interaction = self.call("groupcheck", "Slot A")
         self.assertEqual(self.calls, [("groupcheck", (interaction.user, "Slot A"))])
+
+    def test_notification_commands_require_registration_and_admin_enablement(self):
+        self.callbacks.update({
+            "is_registered_user": lambda user: True,
+            "global_notifications_enabled": lambda: True,
+            "set_notify_mode": lambda user, mode: "saved " + mode,
+            "is_registered_for_slot": lambda user, slot: True,
+            "is_valid_item": lambda slot, item: True,
+            "add_watch": lambda user, slot, item: "watch saved",
+            "remove_watch": lambda user, slot, item: "watch removed",
+            "list_watches": lambda user: "watch list",
+        })
+        notify = self.call("notify", "watched")
+        self.assertEqual(notify.response.messages, [("saved watched", True)])
+        watch = self.call("watch", "Slot A", "Map")
+        self.assertEqual(watch.response.messages, [("watch saved", True)])
+        unwatch = self.call("unwatch", "Slot A", "Map")
+        self.assertEqual(unwatch.response.messages, [("watch removed", True)])
+        watches = self.call("watches")
+        self.assertEqual(watches.response.messages, [("watch list", True)])
+        self.callbacks["global_notifications_enabled"] = lambda: False
+        disabled = self.call("notify", "all")
+        self.assertIn("disabled by the bot administrator", disabled.response.messages[0][0])
+        opt_out = self.call("notify", "off")
+        self.assertEqual(opt_out.response.messages, [("saved off", True)])
+
+    def test_notify_off_does_not_require_registration_and_works_when_global_off(self):
+        self.callbacks.update({
+            "is_registered_user": lambda user: False,
+            "global_notifications_enabled": lambda: False,
+            "set_notify_mode": lambda user, mode: "saved " + mode,
+        })
+        interaction = self.call("notify", "off")
+        self.assertEqual(interaction.response.messages, [("saved off", True)])
+
+    def test_slash_toggle_rejects_stale_command_execution(self):
+        self.callbacks["slash_enabled"] = lambda: False
+        interaction = self.call("help")
+        self.assertEqual(interaction.response.messages, [("Slash commands are disabled.", True)])
 
     def test_chart_callbacks_are_public_helpers_with_private_status(self):
         for name in ("checkcount", "checkgraph", "deathcount"):

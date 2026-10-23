@@ -88,7 +88,14 @@ Hopefully that makes sense.
 For item flag values, channel filter levels, traps, finished-player suppression,
 and how channel posts differ from personal DMs, see [Item notification filters](docs/item-notifications.md).
 
-**All commands are case-sensitive.**
+**All commands are case-sensitive.** `CommandConfig.PrefixCommandsEnabled`
+and `CommandConfig.SlashCommandsEnabled` independently enable the `$` and `/`
+interfaces; both default to `true`. Use JSON booleans and restart after editing
+config. Disabling `$` commands also disables message-only admin commands;
+edit the config file to re-enable them. Disabling `/` commands removes them
+from the configured server on the next successful sync. Notification relays
+and scheduled daily posts continue with either or both interfaces disabled.
+
 |Player Commands|Description|
 |---|---|
 |`$register <slot>`|Adds the slot provided to the user's registration file. A blank slot gets the usage reply instead. Queue file names are derived from the slot: ordinary names keep `<name>.csv`, while Windows device names and characters such as `:` or `/` are percent-encoded (`Con` is stored as `%63on.csv`, `A:B` as `a%3Ab.csv`)|
@@ -108,6 +115,11 @@ and how channel posts differ from personal DMs, see [Item notification filters](
 
 See [Hint result notifications](docs/hint-notifications.md) for relay settings,
 deduplication, and delivery behavior.
+
+Use `/notify` or `$notify` to opt into item pings and `/watch` or `$watch` to
+track an item without spending hint points. Pings also require the global
+`NotificationConfig.ItemMentionsEnabled` setting (default `false`). See
+[opt-in item pings and watches](docs/item-watches.md) for commands and behavior.
 
 |Maintenance Commands|Description|
 |---|---|
@@ -180,6 +192,10 @@ Relayed Archipelago chat, hint results, and `/hint` or `$hint` acknowledgements 
 |`APClientHintLocation`||
 |`APClientVideo`|You get the idea. :)|
 |||
+|**Command Config**||
+|`PrefixCommandsEnabled`|Enable `$` commands, including admin commands (default `true`). Missing or malformed values use `true`.|
+|`SlashCommandsEnabled`|Enable player `/` commands (default `true`). Missing or malformed values use `true`; disabled commands are rejected and removed from the configured server on successful sync.|
+|||
 |**Drawbridge Config**||
 |`DiscordBridgeEnabled`|Will toggle the ability to send messages to AP from Discord|
 |||
@@ -193,6 +209,7 @@ Relayed Archipelago chat, hint results, and `/hint` or `$hint` acknowledgements 
 ||`SelfHostNoWeb` mode disables the check graph, so daily posts require the tracker web page.|
 |||
 |**Notification Config**||
+|`ItemMentionsEnabled`|Allow opted-in registrants to be mentioned on item posts (default `false`). Only JSON `true` enables this. Each player must also choose `all` or `watched` with `/notify` or `$notify`; registration and hints do not grant consent. See [item watches](docs/item-watches.md).|
 |`ConnectionUnavailableMessage`|Message sent after a sustained Archipelago disconnect. Defaults to `Archipelago connection unavailable. {room_url}`. `{room_url}` is wrapped in `<` and `>` to suppress Discord link embeds.|
 |`ConnectionRestoredMessage`|Message sent after a room connection recovers. Defaults to `Archipelago connection restored: {server_address}`. `{server_address}` is the plain host and port, such as `archipelago.gg:38281`.|
 ||Both messages support literal `{room_url}` and `{server_address}` substitutions. Empty or non-string values use the plain text default.|

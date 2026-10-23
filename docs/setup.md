@@ -94,7 +94,12 @@ You're done with the bot portal for now, but keep that token handy!
   1. The bot waits for the next configured time after startup rather than posting immediately, and it remembers the last posted local date in `logs/<UniqueID>/DailyPostState.json` so restarts do not repeat a day. If the process is suspended across the scheduled time, the missed post may still be delivered late once after it resumes.
   1. Each report is attempted once per day. A failed report does not prevent later reports from running. Failures are logged and not retried the same day; the bot tries again at the next day's scheduled time.
   1. `SelfHostNoWeb` mode disables the check graph, so daily posts need the tracker web page.
+- Command Config (optional)
+  1. `PrefixCommandsEnabled` and `SlashCommandsEnabled` default to `true` and independently enable `$` and `/` commands. Use JSON booleans; missing or malformed values use `true`. Restart after editing.
+  1. Disabling prefix commands includes message-only admin commands. Re-enable them through the config file. Disabling slash commands removes them from the configured server on successful sync and rejects stale interactions.
+  1. Notification relays and scheduled reports continue even with both command interfaces disabled.
 - Notification Config (optional)
+  1. `ItemMentionsEnabled` defaults to `false`. Set it to JSON `true` to allow item pings, then each registered player must explicitly opt in with `/notify` or `$notify`. See [item pings and watches](item-watches.md).
   1. `ConnectionUnavailableMessage` and `ConnectionRestoredMessage` customize notices sent after a prolonged room disconnect and after recovery. The built-in defaults are plain text.
   1. Use `{room_url}` for the room URL (the bot supplies `<` and `>` around it to suppress Discord embeds) and `{server_address}` for the plain `host:port` value. Other text, including emoji, is sent as written. Missing, malformed, empty, or non-string values fall back to the built-in messages.
   1. `SleepWakeEditWindowMinutes` (default `15`): if the room is reachable again within this many minutes of the unavailable notice, the bot edits that notice into the restored message instead of posting a second message. `0` always posts a new message.

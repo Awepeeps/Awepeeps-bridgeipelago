@@ -88,8 +88,14 @@ def load_on_message():
         "HINT_FIELD_MAX_LENGTH": HINT_FIELD_MAX_LENGTH,
         "HINT_NOT_REGISTERED_MESSAGE": HINT_NOT_REGISTERED_MESSAGE,
         "CanRequestHint": Mock(return_value=True),
+        "IsKnownItemForSlot": Mock(return_value=True),
+        "UpdateItemWatch": Mock(),
+        "IsRegisteredForSlot": Mock(return_value=False),
+        "BindItemNotificationRegistration": Mock(),
     }
     namespace.update({name: AsyncMock() for name in COMMAND_NAMES})
+    namespace["Command_Register"].return_value = "You've been registered for Slot A!"
+    namespace["PrefixCommandsEnabled"] = lambda: True
     return load(["on_message"], namespace, optional=["IsBotAdmin"])
 
 
@@ -123,6 +129,12 @@ class AdminGateTests(unittest.TestCase):
     def test_plain_member_cannot_run_archinfo(self):
         self.run_as("$archinfo", fake_member())
         self.ns["Command_ArchInfo"].assert_not_awaited()
+
+    def test_disabled_prefix_toggle_blocks_leading_whitespace_commands(self):
+        self.ns["PrefixCommandsEnabled"] = lambda: False
+        self.run_as("   $register Slot A", fake_member())
+        self.ns["SendMainChannelMessage"].assert_not_awaited()
+        self.ns["Command_Register"].assert_not_awaited()
 
     def test_admin_setconfig_keeps_spaces_in_value(self):
         self.run_as("$setconfig ArchipelagoPassword two words", fake_member(administrator=True))

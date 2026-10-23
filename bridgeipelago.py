@@ -26,6 +26,7 @@ import os
 import sys
 from enum import Enum
 import logging
+import hashlib
 
 #Threading Dependencies
 from threading import Thread, Event
@@ -65,6 +66,7 @@ from modules.hint_relay import (
     render_hint_message,
     unused_corrupt_path,
 )
+from modules.item_notifications import ItemNotificationState
 import time
 
 # Bridgeipelago Optional Modules
@@ -196,6 +198,8 @@ def GetCoreFiles(file):
         return GetCoreDirectory("arch") + 'ArchStatus.json'
     elif file == "hintrelay":
         return GetCoreDirectory("log") + 'HintRelay.json'
+    elif file == "itemnotifications":
+        return GetCoreDirectory("reg") + 'ItemNotifications.json'
     elif file == "lang":
         return GetCoreDirectory("core") + CoreConfig["MetaConfig"]["LanguageFile"] + ".lang"
 
@@ -223,6 +227,8 @@ ConnectionUnavailableSince = None
 DailyPostTask = None
 HintRelayTeam = None
 HintRelayStateInstance = None
+ItemNotificationStateInstance = None
+PlayerCommandsSyncedEnabled = None
 
 DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE = "Archipelago connection unavailable. {room_url}"
 DEFAULT_CONNECTION_RESTORED_MESSAGE = "Archipelago connection restored: {server_address}"
@@ -825,6 +831,7 @@ async def StartDailyPostScheduler():
 @discord_client.event
 async def on_ready():
     global MainChannel
+    global PlayerCommandsSyncedEnabled
     MainChannel = discord_client.get_channel(int(CoreConfig["DiscordConfig"]["DiscordBroadcastChannel"]))
     #await MainChannel.send('Bot connected. Battle control - Online.')
     global DebugChannel
@@ -852,15 +859,19 @@ async def on_ready():
         print("Player command sync skipped: configured broadcast channel is missing or has no guild.")
     else:
         guild_id = guild.id
-        if PlayerCommandsSyncedGuild != guild_id:
+        if PlayerCommandsSyncedGuild != guild_id or PlayerCommandsSyncedEnabled != SlashCommandsEnabled():
             guild_object = discord.Object(id=guild_id)
-            tree.copy_global_to(guild=guild_object)
+            if SlashCommandsEnabled():
+                tree.copy_global_to(guild=guild_object)
+            else:
+                tree.clear_commands(guild=guild_object)
             try:
                 await tree.sync(guild=guild_object)
             except Exception as e:
                 print("Player command sync failed for configured guild:", getattr(e, "status", None), type(e).__name__)
             else:
                 PlayerCommandsSyncedGuild = guild_id
+                PlayerCommandsSyncedEnabled = SlashCommandsEnabled()
 
     print("++ ",CoreConfig["AdvancedConfig"]["JoinMessage"])
     print("++ Async bot started -", discord_client.user)
@@ -877,6 +888,9 @@ HelpText = """**Archipelago bot commands** (only work in this channel, lowercase
   `$ketchmeup 2` progression only, `1` + useful, `0` everything
 `$groupcheck <slot>` - all queued items for a slot
 `$hints` - hinted items for your registered slots
+`$notify off|all|watched` - turn item pings off, on for all registered slots, or only watched items
+`$watch <slot> | <item>` / `$unwatch <slot> | <item>` - watch or stop watching an item
+`$watches` - list your active item watches
 
 **Hints & progress**
 `$hint <slot> | <item>` - request a hint for a slot you're registered for, posted here
@@ -893,6 +907,109 @@ def IsBotAdmin(author):
     if permissions is None:
         return False
     return bool(getattr(permissions, "administrator", False) or getattr(permissions, "manage_guild", False))
+
+def SlashCommandsEnabled():
+    config = CoreConfig.get("CommandConfig", {})
+    if not callable(getattr(config, "get", None)):
+        config = {}
+    value = config.get("SlashCommandsEnabled", True)
+    return value if isinstance(value, bool) else True
+
+def PrefixCommandsEnabled():
+    config = CoreConfig.get("CommandConfig", {})
+    if not callable(getattr(config, "get", None)):
+        config = {}
+    value = config.get("PrefixCommandsEnabled", True)
+    return value if isinstance(value, bool) else True
+
+def ItemNotificationsEnabled():
+    config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(config, "get", None)):
+        config = {}
+    return config.get("ItemMentionsEnabled", False) is True
+
+def GetItemNotificationState():
+    global ItemNotificationStateInstance
+    path = GetCoreFiles("itemnotifications")
+    if ItemNotificationStateInstance is None or ItemNotificationStateInstance.path != path:
+        ItemNotificationStateInstance = ItemNotificationState(path)
+    return ItemNotificationStateInstance
+
+def RegisteredSlotsFor(User):
+    path = GetCoreDirectory("reg") + str(User) + ".json"
+    try:
+        with open(path, "r", encoding="utf-8") as source:
+            slots = json.load(source)
+        return slots if isinstance(slots, list) else []
+    except (OSError, ValueError):
+        return []
+
+def RegisteredUserIDsForSlot(slot):
+    return GetItemNotificationState().registered_user_ids(slot, GetCoreDirectory("reg"))
+
+def IsRegisteredForSlot(User, slot):
+    wanted = str(slot).casefold()
+    return any(str(value).casefold() == wanted for value in RegisteredSlotsFor(str(User)))
+
+def IsKnownItemForSlot(slot, item):
+    try:
+        with open(GetCoreFiles("archconnectiondump"), "r", encoding="utf-8") as source:
+            connection = json.load(source)
+        with open(GetCoreFiles("archgamedump"), "r", encoding="utf-8") as source:
+            games = json.load(source)
+        slot_id = next((key for key, value in connection.get("slot_info", {}).items()
+                        if str(value.get("name", "")).casefold() == str(slot).casefold()), None)
+        if slot_id is None:
+            return False
+        game = connection["slot_info"][slot_id].get("game")
+        names = games.get(game, {}).get("item_name_to_id", {})
+        return any(str(name).casefold() == str(item).casefold() for name in names)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+def UpdateItemNotificationMode(User, mode):
+    state = GetItemNotificationState()
+    user_id = getattr(User, "id", None)
+    if RegisteredSlotsFor(str(User)):
+        BindItemNotificationRegistration(User)
+    result = state.set_mode(user_id, mode)
+    return "Item notifications set to {}.".format(mode) if result else "Could not save notification preferences."
+
+def BindItemNotificationRegistration(User):
+    registration_slots = None
+    try:
+        with open(GetCoreDirectory("reg") + str(User) + ".json", "r", encoding="utf-8") as source:
+            value = json.load(source)
+        if isinstance(value, list) and all(isinstance(slot, str) for slot in value):
+            registration_slots = value
+    except (OSError, ValueError, TypeError):
+        pass
+    return GetItemNotificationState().bind_registration(getattr(User, "id", None), str(User), registration_slots)
+
+def ForgetItemPreferences(User):
+    return GetItemNotificationState().unregister(getattr(User, "id", None))
+
+def UpdateItemWatch(User, slot, item, remove=False):
+    if not IsRegisteredForSlot(User, slot):
+        return "You can only watch items for a slot you're registered for."
+    state = GetItemNotificationState()
+    user_id = getattr(User, "id", None)
+    BindItemNotificationRegistration(User)
+    ok = state.remove_watch(user_id, slot, item) if remove else state.add_watch(user_id, slot, item)
+    if not ok:
+        return "Could not save your watch."
+    if remove:
+        return "Stopped watching {} for {}.".format(item, slot)
+    return "Watching {} for {}. Item pings require `/notify all` or `/notify watched` consent.".format(item, slot)
+
+def ListItemWatches(User):
+    state = GetItemNotificationState()
+    watches = state.watches(getattr(User, "id", None))
+    mode = state.mode(getattr(User, "id", None))
+    if not watches:
+        return "You are not watching any items. Notification mode: {}.".format(mode)
+    message = "**Watched items** (notification mode: {})\n".format(mode) + "\n".join("{} | {}".format(value["slot"], value["item"]) for value in watches)
+    return message if len(message) <= 1900 else message[:1880] + "\n… more watches omitted."
 
 def CanRequestHint(author, slot):
     # A hint spends the slot's own hint points, so only people registered to
@@ -917,6 +1034,9 @@ async def on_message(message):
     
     if message.channel.id != MainChannel.id:
         return
+
+    if message.content.lstrip().startswith('$') and not PrefixCommandsEnabled():
+        return
     
     # Registers user for a alot in Archipelago
     RegisterParts = message.content.split(None, 1)
@@ -926,11 +1046,17 @@ async def on_message(message):
             await SendMainChannelMessage("Use `$register <slot>` with the exact slot name from Archipelago.")
         else:
             Status = await Command_Register(str(message.author),ArchSlot)
+            if Status.startswith("You've been registered") or Status.startswith("You're already registered"):
+                BindItemNotificationRegistration(message.author)
             await SendMainChannelMessage(Status)
 
     # Clears registration file for user
     if message.content.startswith('$clearreg'):
         Status = await Command_ClearReg(str(message.author))
+        if not ForgetItemPreferences(message.author):
+            Status = str(Status) + " Item notification preferences could not be cleared; try again."
+        elif Status == "You're not registered for any slots :(":
+            Status = "You're not registered for slots; item preferences were cleared."
         await SendMainChannelMessage(Status)
 
     if message.content.startswith('$listreg'):
@@ -954,10 +1080,37 @@ async def on_message(message):
     
     if message.content.startswith('$hints'):
         await Command_Hints(message.author)
+
+    NotifyParts = message.content.split(None, 1)
+    if NotifyParts and NotifyParts[0] == '$notify':
+        mode = NotifyParts[1].strip().lower() if len(NotifyParts) > 1 else ''
+        if mode not in ('off', 'all', 'watched'):
+            await SendMainChannelMessage("Use `$notify off`, `$notify all`, or `$notify watched`.")
+        elif mode != 'off' and not RegisteredSlotsFor(str(message.author)):
+            await SendMainChannelMessage("Register for a slot before changing notification settings.")
+        elif mode != 'off' and not ItemNotificationsEnabled():
+            await SendMainChannelMessage("Item notification pings are disabled by the bot administrator.")
+        else:
+            await SendMainChannelMessage(UpdateItemNotificationMode(message.author, mode))
+
+    for command_name, remove in (('$watch', False), ('$unwatch', True)):
+        if NotifyParts and NotifyParts[0] == command_name:
+            fields = [value.strip() for value in (NotifyParts[1] if len(NotifyParts) > 1 else '').split('|', 1)]
+            if len(fields) != 2 or not all(fields):
+                await SendMainChannelMessage("Use `{}` <slot> | <item>.".format(command_name))
+            elif not IsRegisteredForSlot(message.author, fields[0]):
+                await SendMainChannelMessage(HINT_NOT_REGISTERED_MESSAGE)
+            elif not IsKnownItemForSlot(fields[0], fields[1]):
+                await SendMainChannelMessage("Use the exact item name for that slot.")
+            else:
+                await SendMainChannelMessage(UpdateItemWatch(message.author, fields[0], fields[1], remove))
+
+    if NotifyParts and NotifyParts[0] == '$watches':
+        await SendMainChannelMessage(ListItemWatches(message.author))
     
     HintParts = message.content.split(None, 1)
     if HintParts and HintParts[0] == '$hint':
-        hintrequest = [item.strip() for item in (HintParts[1] if len(HintParts) > 1 else "").split('|')]
+        hintrequest = [item.strip() for item in (HintParts[1] if len(HintParts) > 1 else "").split('|', 1)]
         if not(len(hintrequest)==2 and all(hintrequest)):
             await SendMainChannelMessage("Invalid $hint format. Use `$hint <slot>|<item>`")
         elif any(len(field) > HINT_FIELD_MAX_LENGTH for field in hintrequest):
@@ -965,6 +1118,8 @@ async def on_message(message):
         elif not CanRequestHint(message.author, hintrequest[0]):
             await SendMainChannelMessage(HINT_NOT_REGISTERED_MESSAGE)
         else:
+            if IsRegisteredForSlot(message.author, hintrequest[0]) and IsKnownItemForSlot(hintrequest[0], hintrequest[1]):
+                UpdateItemWatch(message.author, hintrequest[0], hintrequest[1])
             hint_queue.put(hintrequest)
             await SendMainChannelMessage(str(message.author) + " requested a hint for " + hintrequest[0] + ": " + hintrequest[1])
 
@@ -1203,12 +1358,14 @@ async def ProcessItemQueue():
 
             # If this item is for a player who's snoozed, we skip sending the message entirely
             if CheckSnoozeStatus(recipient):
+                RecordFilteredItemArrival(recipient, item, itemmessage)
                 await CancelProcess()
             elif int(itemclass) == 4 and CoreConfig["ItemFilterConfig"]["BotItemSpoilTraps"] == True:
-                await SendMainChannelMessage(message)
+                await SendItemBroadcast(message, recipient, item, itemmessage)
             elif int(itemclass) != 4 and ItemFilter(int(itemclass),CoreConfig["ItemFilterConfig"]["BotItemFilterLevel"]):
-                await SendMainChannelMessage(message)
+                await SendItemBroadcast(message, recipient, item, itemmessage)
             else:
+                RecordFilteredItemArrival(recipient, item, itemmessage)
                 #In Theory, this should only be called when the two above conditions are not met
                 #So we call this dummy function to escape the async call.
                 await CancelProcess()
@@ -1465,6 +1622,63 @@ async def ProcessChatQueue():
 async def SendMainChannelMessage(message):
     # Relayed Archipelago chat must never be able to ping @everyone or roles.
     await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
+
+async def SendItemBroadcast(message, slot, item, event):
+    """Post the existing item broadcast with only explicitly opted-in mentions."""
+    registered_ids = RegisteredUserIDsForSlot(slot)
+    event_key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    state = GetItemNotificationState()
+    recipients = [] if state.was_delivered(event_key) else state.recipients(slot, item, registered_ids)
+    users = [discord.Object(id=user_id) for user_id in recipients]
+    if not ItemNotificationsEnabled():
+        users = []
+    # Keep the normal case to one post: original item text plus all mentions
+    # that fit under Discord's content and allowed-user limits.
+    base = str(message)
+    first_users, remaining = [], []
+    first_text = base
+    for user in users:
+        mention = "<@{}>".format(user.id)
+        appended = " " + mention
+        if len(first_users) < 100 and len(first_text) + len(appended) <= 2000:
+            first_users.append(user)
+            first_text += appended
+        else:
+            remaining.append((user, mention))
+    # Extremely long legacy text is chunked; actual item broadcasts fit one post.
+    base_chunks = [first_text[i:i + 2000] for i in range(0, len(first_text), 2000)] or [""]
+    await MainChannel.send(
+        base_chunks[0],
+        allowed_mentions=discord.AllowedMentions(users=first_users, roles=False, everyone=False, replied_user=False),
+    )
+    for chunk in base_chunks[1:]:
+        await MainChannel.send(chunk, allowed_mentions=discord.AllowedMentions.none())
+    # Overflow is exceptional. Keep each follow-up contextual and within both
+    # Discord limits; the base post has already succeeded if an overflow send fails.
+    overflow = []
+    context = "More opted-in players for {} / {}: ".format(slot, item)
+    current, current_length = [], len(context)
+    for user, mention in remaining:
+        added = len(mention) + (1 if current else 0)
+        if current and (len(current) >= 100 or current_length + added > 2000):
+            overflow.append(current)
+            current, current_length, added = [], len(context), len(mention)
+        current.append((user, mention))
+        current_length += added
+    if current:
+        overflow.append(current)
+    for chunk in overflow:
+        content = context + " ".join(mention for _, mention in chunk)
+        await MainChannel.send(content, allowed_mentions=discord.AllowedMentions(users=[user for user, _ in chunk], roles=False, everyone=False, replied_user=False))
+    if not state.was_delivered(event_key):
+        state.complete_delivery(event_key, slot, item, registered_ids)
+
+def RecordFilteredItemArrival(slot, item, event):
+    """Complete matching watches for an item observed but filtered from channel output."""
+    key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    state = GetItemNotificationState()
+    if not state.was_delivered(key):
+        state.complete_delivery(key, slot, item, RegisteredUserIDsForSlot(slot))
 
 DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES = 15
 RoomSleepNoticeMessage = None
@@ -2206,6 +2420,10 @@ PLAYER_COMMAND_NAMES = register_player_commands(
 /groupcheck slot — DM queued items for a slot
 /hints — DM assigned hints
 /hint slot item — request a hint for a slot you're registered for
+/notify mode — choose off, all registered slots, or watched items
+/watch slot item — watch an item in a registered slot
+/unwatch slot item — stop watching an item
+/watches — list active item watches
 /checkcount — post check counts
 /checkgraph — post progress graph
 /deathcount — post DeathLink tally""",
@@ -2217,12 +2435,32 @@ PLAYER_COMMAND_NAMES = register_player_commands(
         "hints": Command_Hints,
         "hint_queue": lambda: hint_queue,
         "can_hint": CanRequestHint,
+        "slash_enabled": SlashCommandsEnabled,
+        "global_notifications_enabled": ItemNotificationsEnabled,
+        "is_registered_user": lambda user: bool(RegisteredSlotsFor(str(user))),
+        "is_registered_for_slot": IsRegisteredForSlot,
+        "is_valid_item": IsKnownItemForSlot,
+        "set_notify_mode": UpdateItemNotificationMode,
+        "bind_registration": BindItemNotificationRegistration,
+        "add_watch": lambda user, slot, item: UpdateItemWatch(user, slot, item),
+        "remove_watch": lambda user, slot, item: UpdateItemWatch(user, slot, item, True),
+        "list_watches": ListItemWatches,
+        "clear_preferences": ForgetItemPreferences,
         "checkcount": Command_CheckCount,
         "checkgraph": Command_CheckGraph,
         "deathcount": Command_DeathCount,
     },
     lambda: CoreConfig["DiscordConfig"]["DiscordBroadcastChannel"],
 )
+
+async def EnforceSlashCommandToggle(interaction):
+    if SlashCommandsEnabled():
+        return True
+    if not interaction.response.is_done():
+        await interaction.response.send_message("Slash commands are disabled.", ephemeral=True)
+    return False
+
+tree.interaction_check = EnforceSlashCommandToggle
 
 
 async def Command_ILoveYou(message):

@@ -83,6 +83,9 @@ Hopefully that makes sense.
 ---
 
 ## Commands
+For item flag values, channel filter levels, traps, finished-player suppression,
+and how channel posts differ from personal DMs, see [Item notification filters](docs/item-notifications.md).
+
 **All commands are case-sensitive.**
 |Player Commands|Description|
 |---|---|

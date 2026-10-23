@@ -77,6 +77,7 @@ You're done with the bot portal for now, but keep that token handy!
   1. Fill out `ArchipelagoServerURL` with the room URL
   1. Fill out `UniqueID` with the RoomID/seed/an arbitrary value (see [UniqueID](#UniqueID) for detailed usage)
 - Item Filter Config
+  - See [Item notification filters](item-notifications.md) for flag values and how channel filters differ from DM filters.
   1. Set `BotItemSpoilTraps` to `true` if you'd like to have traps spoiled, or change to `false` to hide traps
   1. Set `BotItemFilterLevel` to the level you'd like: `0`, `1`, or `2` (see the main [Readme](/README.md) for details on what the filter levels mean). Level `2` means progression items only. This value is read from your local `config.json` (ignored by git), not hardcoded in the bot. The generic `config.json.template` keeps the default level `0`.
 - Relay Config

@@ -111,6 +111,9 @@ class RoomSleepNoticeTests(unittest.TestCase):
         self.assertFalse(namespace["RoomAsleep"])
         self.assertEqual(len(namespace["chat_queue"].messages), 2)
         self.assertEqual(namespace["chat_queue"].messages[1]["data"]["text"], "Archipelago connection restored: archipelago.gg:38281")
+        # The Discord side edits a recent sleep notice based on these flags.
+        self.assertEqual([m["flag"] for m in namespace["chat_queue"].messages], ["ROOM_SLEEP", "ROOM_WAKE"])
+        self.assertEqual({m["type"] for m in namespace["chat_queue"].messages}, {"CORE"})
 
     def test_emoji_templates_and_custom_text_are_preserved_with_dynamic_values(self):
         _, namespace = load_tracker_client()
@@ -160,6 +163,7 @@ class RoomSleepNoticeTests(unittest.TestCase):
         self.assertIn("{room_url}", notifications["ConnectionUnavailableMessage"])
         self.assertIn("☀️", notifications["ConnectionRestoredMessage"])
         self.assertIn("{server_address}", notifications["ConnectionRestoredMessage"])
+        self.assertEqual(notifications["SleepWakeEditWindowMinutes"], 15)
         _, namespace = load_tracker_client()
         self.assertEqual(namespace["DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE"], "Archipelago connection unavailable. {room_url}")
         self.assertEqual(namespace["DEFAULT_CONNECTION_RESTORED_MESSAGE"], "Archipelago connection restored: {server_address}")

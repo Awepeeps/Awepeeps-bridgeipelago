@@ -288,7 +288,7 @@ def QueueRoomWakeNotice():
         return
     placeholders = GetConnectionNotificationPlaceholders()
     message = RenderConnectionNotification("ConnectionRestoredMessage", DEFAULT_CONNECTION_RESTORED_MESSAGE, placeholders)
-    chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "None"})
+    chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "ROOM_WAKE"})
     RoomAsleep = False
     ConnectionUnavailableSince = None
 
@@ -299,7 +299,7 @@ def QueueRoomUnavailableNotice():
     if not RoomAsleep:
         placeholders = GetConnectionNotificationPlaceholders()
         message = RenderConnectionNotification("ConnectionUnavailableMessage", DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE, placeholders)
-        chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "None"})
+        chat_queue.put({"type": "CORE", "data": {"text": message}, "flag": "ROOM_SLEEP"})
         RoomAsleep = True
 
 #Discord Bot Initialization
@@ -1358,7 +1358,10 @@ async def ProcessChatQueue():
                     # Never leak a full hint snapshot into the error log.
                     ReportHintRelayDeliveryIssue("hint relay message failed: " + type(e).__name__)
             elif Message['type'] == "CORE":
-                await SendMainChannelMessage(Message['data']['text'])
+                if Message.get('flag') in ("ROOM_SLEEP", "ROOM_WAKE"):
+                    await SendRoomConnectionNotice(Message)
+                else:
+                    await SendMainChannelMessage(Message['data']['text'])
             elif Message['type'] == "HTMessage":
                 if Message['flag'] == "ERROR":
                     await SendMainChannelMessage(Message['data']['text'])
@@ -1462,6 +1465,47 @@ async def ProcessChatQueue():
 async def SendMainChannelMessage(message):
     # Relayed Archipelago chat must never be able to ping @everyone or roles.
     await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
+
+DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES = 15
+RoomSleepNoticeMessage = None
+RoomSleepNoticeSentAt = None
+
+def GetSleepWakeEditWindowSeconds():
+    """NotificationConfig.SleepWakeEditWindowMinutes in seconds; 0 always posts a new wake notice."""
+    notification_config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(notification_config, "get", None)):
+        notification_config = {}
+    minutes = notification_config.get("SleepWakeEditWindowMinutes", DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES)
+    try:
+        if isinstance(minutes, bool):
+            raise ValueError("not a number of minutes")
+        minutes = float(minutes)
+    except (TypeError, ValueError):
+        minutes = DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES
+    if not 0 <= minutes < float("inf"):
+        minutes = DEFAULT_SLEEP_WAKE_EDIT_WINDOW_MINUTES
+    return minutes * 60
+
+async def SendRoomConnectionNotice(Message):
+    """Post a sleep notice. If the room wakes soon after, edit that notice instead of posting again."""
+    global RoomSleepNoticeMessage, RoomSleepNoticeSentAt
+    text = Message['data']['text']
+    SleepMessage = RoomSleepNoticeMessage
+    SentAt = RoomSleepNoticeSentAt
+    RoomSleepNoticeMessage = None
+    RoomSleepNoticeSentAt = None
+    if Message.get('flag') == "ROOM_SLEEP":
+        RoomSleepNoticeMessage = await MainChannel.send(text, allowed_mentions=discord.AllowedMentions.none())
+        RoomSleepNoticeSentAt = time.monotonic()
+        return
+    if SleepMessage is not None and time.monotonic() - SentAt < GetSleepWakeEditWindowSeconds():
+        try:
+            await SleepMessage.edit(content=text, allowed_mentions=discord.AllowedMentions.none())
+            return
+        except discord.HTTPException as e:
+            # The notice may have been deleted; fall back to a new message.
+            WriteToErrorLog("RoomNotice", "Could not edit the sleep notice, posting instead: " + type(e).__name__)
+    await SendMainChannelMessage(text)
 
 async def SendDebugChannelMessage(message):
     await DebugChannel.send(message)

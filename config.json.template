@@ -58,6 +58,7 @@
     "NotificationConfig": {
         "ConnectionUnavailableMessage": "💤 The Archipelago room may be asleep. Open {room_url} to wake it up.",
         "ConnectionRestoredMessage": "☀️ The Archipelago room is reachable again at **{server_address}**.",
+        "SleepWakeEditWindowMinutes": 15,
         "HintMessage": "🔎 {receiver} received a hint: {item} is at {location} in {finder}'s world. Status: {status}.{entrance}"
     },
     "MetaConfig": {

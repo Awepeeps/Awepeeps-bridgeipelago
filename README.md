@@ -196,6 +196,7 @@ Relayed Archipelago chat, hint results, and `/hint` or `$hint` acknowledgements 
 |`ConnectionUnavailableMessage`|Message sent after a sustained Archipelago disconnect. Defaults to `Archipelago connection unavailable. {room_url}`. `{room_url}` is wrapped in `<` and `>` to suppress Discord link embeds.|
 |`ConnectionRestoredMessage`|Message sent after a room connection recovers. Defaults to `Archipelago connection restored: {server_address}`. `{server_address}` is the plain host and port, such as `archipelago.gg:38281`.|
 ||Both messages support literal `{room_url}` and `{server_address}` substitutions. Empty or non-string values use the plain text default.|
+|`SleepWakeEditWindowMinutes`|If the room is reachable again within this many minutes of the unavailable notice, the bot edits that notice into the restored message instead of posting a second one. Defaults to `15`; `0` always posts a new message. Invalid values use `15`.|
 |||
 |**Meta Config**||
 |`FlavorDeathLink`|Will change deathlink messages to have a little more personality [4]|

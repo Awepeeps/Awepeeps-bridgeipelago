@@ -97,6 +97,7 @@ You're done with the bot portal for now, but keep that token handy!
 - Notification Config (optional)
   1. `ConnectionUnavailableMessage` and `ConnectionRestoredMessage` customize notices sent after a prolonged room disconnect and after recovery. The built-in defaults are plain text.
   1. Use `{room_url}` for the room URL (the bot supplies `<` and `>` around it to suppress Discord embeds) and `{server_address}` for the plain `host:port` value. Other text, including emoji, is sent as written. Missing, malformed, empty, or non-string values fall back to the built-in messages.
+  1. `SleepWakeEditWindowMinutes` (default `15`): if the room is reachable again within this many minutes of the unavailable notice, the bot edits that notice into the restored message instead of posting a second message. `0` always posts a new message.
   1. `HintMessage` (see [Hint result notifications](hint-notifications.md)) replaces the complete hint result announcement. Placeholders: `{receiver}`, `{item}`, `{location}`, `{finder}`, `{status}`, `{entrance}`. Result posts never ping anyone and are capped at Discord's 2000-character limit. The built-in fallback is plain text without any emoji; emoji prefixes in the shipped `config.json.template` are examples, not defaults.
 
 You're free to leave the Advanced Config section as-is unless you know what you're doing.  

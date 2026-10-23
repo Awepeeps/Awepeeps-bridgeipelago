@@ -81,7 +81,8 @@ You're done with the bot portal for now, but keep that token handy!
   1. Set `BotItemSpoilTraps` to `true` if you'd like to have traps spoiled, or change to `false` to hide traps
   1. Set `BotItemFilterLevel` to the level you'd like: `0`, `1`, or `2` (see the main [Readme](/README.md) for details on what the filter levels mean). Level `2` means progression items only. This value is read from your local `config.json` (ignored by git), not hardcoded in the bot. The generic `config.json.template` keeps the default level `0`.
 - Relay Config
-  1. Set desired AP to Discord relay options.
+  1. Set desired AP to Discord relay options. For hint result notifications,
+     see [Hint result notifications](hint-notifications.md).
 - Drawbridge Config
   1. Set `DiscordBridgeEnabled` to `true` if you'd like chat from discord bridged to AP.
 - Meta Config

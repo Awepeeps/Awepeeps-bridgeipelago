@@ -104,6 +104,9 @@ and how channel posts differ from personal DMs, see [Item notification filters](
 |`$checkcount`|Fetches the current Arch server's progress in simple txt format|
 |`$checkgraph`|Plots the current Arch progress in a picture|
 
+See [Hint result notifications](docs/hint-notifications.md) for relay settings,
+deduplication, and delivery behavior.
+
 |Admin Commands|Description|
 |---|---|
 |`$iloveyou`|We all need to hear this sometimes.|

@@ -56,6 +56,7 @@ from modules.daily_post import (
     load_daily_post_settings,
     run_daily_posts,
 )
+from modules.hint_relay import HintRelayState, format_hint_status, hint_subscription_keys, normalize_requested_hint, render_hint_message
 import time
 
 # Bridgeipelago Optional Modules
@@ -153,6 +154,8 @@ def GetCoreFiles(file):
         return GetCoreDirectory("arch") + 'ArchRoomData.json'
     elif file == "archstatus":
         return GetCoreDirectory("arch") + 'ArchStatus.json'
+    elif file == "hintrelay":
+        return GetCoreDirectory("log") + 'HintRelay.json'
     elif file == "lang":
         return GetCoreDirectory("core") + CoreConfig["MetaConfig"]["LanguageFile"] + ".lang"
 
@@ -178,6 +181,8 @@ tracker_client = None
 RoomAsleep = False
 ConnectionUnavailableSince = None
 DailyPostTask = None
+HintRelayTeam = None
+HintRelayStateInstance = None
 
 DEFAULT_CONNECTION_UNAVAILABLE_MESSAGE = "Archipelago connection unavailable. {room_url}"
 DEFAULT_CONNECTION_RESTORED_MESSAGE = "Archipelago connection restored: {server_address}"
@@ -305,6 +310,9 @@ class TrackerClient():
         self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
         self.is_closed = Event()
+        self.hint_baseline_keys = set()
+        self.hint_store_keys = set()
+        self.hint_prebaseline_replies = {}
 
     def run(self):
         #=== Main Run Loop ===
@@ -340,13 +348,43 @@ class TrackerClient():
                             QueueRoomWakeNotice()
                             WriteArchConnectionJSON(args)
                             print("-- Tracker connected to server.")
+                            if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                                self.subscribe_hint_results(args)
+                        elif cmd == 'Retrieved' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                            retrieved = args.get('keys', {})
+                            baseline_count = 0
+                            baseline_hints = 0
+                            if isinstance(retrieved, dict):
+                                for key, values in retrieved.items():
+                                    key = str(key)
+                                    if key not in self.hint_baseline_keys or not isinstance(values, list):
+                                        continue
+                                    self.hint_baseline_keys.remove(key)
+                                    baseline_count += 1
+                                    baseline_hints += len(values)
+                                    self.queue_hint_snapshot(key, values, True)
+                                    for early_values in self.hint_prebaseline_replies.pop(key, []):
+                                        self.queue_hint_snapshot(key, early_values, False)
+                            print("-- Hint relay baseline processed: {} stores, {} hints.".format(baseline_count, baseline_hints))
+                        elif cmd == 'SetReply' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                            values = args.get('value')
+                            if isinstance(values, list):
+                                key = str(args.get('key', ''))
+                                if key not in self.hint_store_keys:
+                                    continue
+                                if key in self.hint_baseline_keys:
+                                    self.hint_prebaseline_replies.setdefault(key, []).append(values)
+                                else:
+                                    self.queue_hint_snapshot(key, values, False)
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
                             print("Tracker Connection refused by server - check your slot name / port / whatever, and try again.")
                             WriteToErrorLog("Websocket", "Tracker Connection refused by server - check your slot name / port / whatever, and try again.")
                             WriteToErrorLog("Websocket", str(args))
                             seppuku_queue.put(args)
                         elif cmd == self.MessageCommand.PRINT_JSON.value:
-                            if args.get('type') == 'ItemSend':
+                            if args.get('type') == 'Hint' and CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                                pass  # Hint PrintJSON is not sent to spectator clients; SetReply is authoritative.
+                            elif args.get('type') == 'ItemSend':
                                 item_queue.put(args)
                             elif args.get('type') == 'Chat':
                                 if CoreConfig["RelayConfig"]["ChatMessages"] == True:
@@ -454,6 +492,30 @@ class TrackerClient():
     def send_message(self, message: dict) -> None:
         self.ap_connection.send(json.dumps([message]))
 
+    def send_messages(self, messages: list[dict]) -> None:
+        self.ap_connection.send(json.dumps(messages))
+
+    def subscribe_hint_results(self, connected: dict) -> None:
+        global HintRelayTeam
+        team, keys = hint_subscription_keys(connected)
+        HintRelayTeam = team
+        self.hint_baseline_keys = set(keys)
+        self.hint_store_keys = set(keys)
+        self.hint_prebaseline_replies = {}
+        print("-- Hint relay connected; subscribing to {} same-team hint stores.".format(len(keys)))
+        if keys:
+            self.send_messages([
+                {"cmd": "SetNotify", "keys": keys},
+                {"cmd": "Get", "keys": keys},
+            ])
+
+    def queue_hint_snapshot(self, key: str, values: list, baseline: bool) -> None:
+        values = [dict(hint) if isinstance(hint, dict) else hint for hint in values]
+        for hint in values:
+            if isinstance(hint, dict):
+                hint.setdefault("team", HintRelayTeam)
+        chat_queue.put({"type": "HINT_SNAPSHOT", "data": {"key": key, "hints": values, "baseline": baseline}, "flag": "None"})
+
     def stop(self) -> None:
         self.is_closed.set()
         self.ap_connection.close()
@@ -511,6 +573,7 @@ class HintClient:
         self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
         self.is_closed = Event()
+        self.team = None
         self.hintqueuepayload = hintprocessing_queue.get()
 
     def run(self):
@@ -530,6 +593,7 @@ class HintClient:
                             self.send_connect()
                         elif cmd == self.MessageCommand.CONNECTED.value:
                             print("-- HintClient received CONNECTED.")
+                            self.team = args.get('team')
                             self.process_hint()
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
                             print("HintClient CONNECTION_REFUSED by server - check your slot name / port / whatever, and try again.")
@@ -538,7 +602,11 @@ class HintClient:
                             chat_queue.put(MessageObject)
                         elif cmd == self.MessageCommand.PRINT_JSON.value:
                             if args.get('type') == 'Hint':
-                                chat_queue.put(MessageObject)
+                                if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
+                                    hint = normalize_requested_hint(args, self.team)
+                                    chat_queue.put({"type": "HINT_REQUESTED", "data": hint, "flag": "None"})
+                                else:
+                                    chat_queue.put(MessageObject)
                             elif args.get('type') == 'CommandResult':
                                 chat_queue.put(MessageObject)
                             elif args.get('type') == 'Join' or args.get('type') == 'Tutorial' or args.get('type') == 'Chat':
@@ -1046,6 +1114,50 @@ async def ProcessDeathQueue():
         else:
             return
 
+def _hint_lookup(lookup, *args, fallback):
+    try:
+        result = lookup(*args)
+        return result if result not in (None, "", "NULL") else fallback
+    except Exception:
+        return fallback
+
+async def SendHintResult(hint):
+    receiver = str(hint.get("receiving_player", "?"))
+    finder = str(hint.get("finding_player", "?"))
+    receiver_game = str(_hint_lookup(LookupGame, receiver, fallback="Unknown game"))
+    finder_game = str(_hint_lookup(LookupGame, finder, fallback="Unknown game"))
+    receiver_name = str(_hint_lookup(LookupSlot, receiver, fallback="Player " + receiver))
+    finder_name = str(_hint_lookup(LookupSlot, finder, fallback="Player " + finder))
+    item = str(_hint_lookup(LookupItem, receiver_game, str(hint.get("item", "?")), fallback="Item #" + str(hint.get("item", "?"))))
+    location = str(_hint_lookup(LookupLocation, finder_game, str(hint.get("location", "?")), fallback="Location #" + str(hint.get("location", "?"))))
+    status = format_hint_status(hint.get("status"), hint.get("found", False))
+    entrance = hint.get("entrance")
+    entrance_text = " Entrance: " + str(entrance) if entrance else ""
+    fallback = "Hint result: {receiver}'s {item} is at {finder}'s World at {location}. Status: {status}.{entrance}"
+    notification_config = CoreConfig.get("NotificationConfig", {})
+    if not callable(getattr(notification_config, "get", None)):
+        notification_config = {}
+    message = render_hint_message(notification_config.get("HintMessage"), fallback, {
+        "receiver": receiver_name, "item": item, "location": location,
+        "finder": finder_name, "status": status, "entrance": entrance_text,
+    })
+    await MainChannel.send(message, allowed_mentions=discord.AllowedMentions.none())
+
+async def HandleHintRelayMessage(message):
+    global HintRelayStateInstance
+    if HintRelayStateInstance is None:
+        HintRelayStateInstance = HintRelayState(GetCoreFiles("hintrelay"))
+        if HintRelayStateInstance.corrupt:
+            print("-- Hint relay state was unreadable; the next store snapshots will be silently baselined.")
+    if message["type"] == "HINT_SNAPSHOT":
+        data = message.get("data", {})
+        HintRelayStateInstance.observe_snapshot(data.get("key", ""), data.get("hints", []))
+    elif message["type"] == "HINT_REQUESTED":
+        HintRelayStateInstance.enqueue_requested(message.get("data", {}))
+    for identity, hint in HintRelayStateInstance.pending_items():
+        await SendHintResult(hint)
+        HintRelayStateInstance.mark_delivered(identity)
+
 @tasks.loop(seconds=float(OverClockValue))
 async def ProcessChatQueue():
     # Messages are passed to the chat queue in the following format:
@@ -1069,11 +1181,17 @@ async def ProcessChatQueue():
     # MessageObject = {"type": "CORE", "data": args, "flag": "None"}
     
     try:
+        if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True and HintRelayStateInstance is not None:
+            for identity, hint in HintRelayStateInstance.pending_items():
+                await SendHintResult(hint)
+                HintRelayStateInstance.mark_delivered(identity)
         if chat_queue.empty():
             return
         else:
             Message = chat_queue.get()
-            if Message['type'] == "CORE":
+            if Message['type'] in ("HINT_SNAPSHOT", "HINT_REQUESTED"):
+                await HandleHintRelayMessage(Message)
+            elif Message['type'] == "CORE":
                 await SendMainChannelMessage(Message['data']['text'])
             elif Message['type'] == "HTMessage":
                 if Message['flag'] == "ERROR":

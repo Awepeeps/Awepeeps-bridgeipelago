@@ -48,6 +48,13 @@ Merge these values into the existing sections of your ignored local
 The values persist across restarts and are not hardcoded community preferences.
 The generic `config.json.template` defaults to filter level `0`.
 
+A pending [item watch](item-watches.md) from a currently registered player
+overrides `BotItemFilterLevel` for that item and recipient. A watched filler
+item is therefore posted in a progression-only channel. This does not enable
+pings for a player who has not opted in, and does not bypass the separate
+pure-trap spoiler setting or finished-player suppression. Unwatched items
+continue to use the level checks above.
+
 `SnoozeCompletedGames` checks the **recipient's** recorded goal status. It
 suppresses posts to that finished player, even for progression items; it does
 not suppress an item merely because its sender has finished.

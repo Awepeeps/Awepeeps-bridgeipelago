@@ -3,17 +3,19 @@ import tempfile
 import unittest
 import ast
 import json
+import os
 import threading
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from modules.hint_relay import (
     HintRelayState, MAX_DISCORD_TEXT_LENGTH, deliver_pending_hints,
     format_hint_status, hint_identity, hint_subscription_keys,
     normalize_requested_hint, render_hint_message, unused_corrupt_path,
 )
+from modules.item_notifications import ItemNotificationState, resolved_hint_matches
 
 
 class FakeClock:
@@ -504,6 +506,10 @@ def load_hint_client(relay_config):
             InvalidState=type("InvalidState", (Exception,), {}),
         )),
         "normalize_requested_hint": normalize_requested_hint,
+        "HintWatchMatchesRequest": lambda context, hint: resolved_hint_matches(
+            context.get("item", ""), hint.get("item"),
+            {"Mask Fragment: Left": 99, "Mask Fragment: Dragon": 100, "Map": 1},
+        ),
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), "bridgeipelago.py", "exec"), namespace)
     return namespace["HintClient"], namespace
@@ -677,6 +683,131 @@ class TrackerHintProtocolTests(unittest.TestCase):
         client.run()
         self.assertEqual([message["type"] for message in ns["chat_queue"].messages], ["HTMessage", "HTMessage"])
 
+    def test_typoed_request_resolves_canonical_watch_when_hint_relay_is_disabled(self):
+        client_type, ns = load_hint_client({})
+        ns["LookupSlot"] = lambda slot_id: {"2": "Slot B"}.get(str(slot_id), "NULL")
+        context = {"requester_id": 100, "requester_name": "Alice", "registered_at_request": True,
+                   "slot": "Slot B", "item": "Mask Fragement: Left"}
+        client = client_type.__new__(client_type)
+        client.is_closed = threading.Event()
+        client.team = None
+        client.connected_slot = None
+        client.request_context = context
+        client.hintqueuepayload = "Mask Fragement: Left"
+        client.ap_connection = Mock()
+        response = {"cmd": "PrintJSON", "type": "Hint", "receiving": 2, "found": False,
+                    "item": {"item": 99, "location": 42, "player": 1, "flags": 0}, "data": []}
+        client.ap_connection.recv = Mock(side_effect=lambda timeout=None: (
+            client.is_closed.set(), json.dumps([
+                {"cmd": "Connected", "team": 0, "slot": 2}, response,
+            ])
+        )[1])
+        client.run()
+        watch_events = [message for message in ns["chat_queue"].messages
+                        if message["type"] == "HINT_WATCH_RESOLVED"]
+        self.assertEqual(len(watch_events), 1)
+        event = watch_events[0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            state = ItemNotificationState(str(Path(directory) / "items.json"))
+            state.bind_registration(100, "Alice", ["Slot B"])
+            state.set_mode(100, "watched")
+            state_file = os.path.join(directory, "Alice.json")
+            Path(state_file).write_text('["Slot B"]', encoding="utf-8")
+            bridge = load_bridge_functions({"HandleHintRelayMessage"}, {
+                "InitializeHintRelayState": Mock(side_effect=AssertionError("relay must stay disabled")),
+                "RegisteredUserIDsForSlot": lambda slot: state.registered_user_ids(slot, directory),
+                "LookupGame": lambda slot_id: "Test Game",
+                "LookupItem": lambda game, item_id: {"99": "Mask Fragment: Left"}.get(str(item_id), "NULL"),
+                "GetItemNotificationState": lambda: state,
+                "DeliverPendingHintResults": AsyncMock(),
+                "ReportHintRelayDeliveryIssue": Mock(),
+            })
+            asyncio.run(bridge["HandleHintRelayMessage"](event))
+            self.assertEqual(state.watches(100), [{"slot": "Slot B", "item": "Mask Fragment: Left"}])
+
+            item_state = state
+            sent = AsyncMock()
+            class AllowedMentions:
+                @staticmethod
+                def none():
+                    return {"users": []}
+                def __new__(cls, **kwargs):
+                    return kwargs
+            filter_ns = load_bridge_functions({"ItemEventKey", "HasActiveItemWatch", "ItemPassesChannelFilter", "SendItemBroadcast"}, {
+                "hashlib": __import__("hashlib"), "json": json,
+                "GetItemNotificationState": lambda: item_state,
+                "RegisteredUserIDsForSlot": lambda slot: item_state.registered_user_ids(slot, directory),
+                "CoreConfig": {"ItemFilterConfig": {"BotItemSpoilTraps": False, "BotItemFilterLevel": 2}},
+                "ItemFilter": lambda itemclass, level: bool(itemclass & 1),
+                "MainChannel": SimpleNamespace(send=sent),
+                "ItemNotificationsEnabled": lambda: True,
+                "discord": SimpleNamespace(Object=lambda id: SimpleNamespace(id=id), AllowedMentions=AllowedMentions),
+            })
+            self.assertTrue(filter_ns["ItemPassesChannelFilter"](0, "Slot B", "Mask Fragment: Left", {"event": "new filler"}))
+            self.assertFalse(filter_ns["ItemPassesChannelFilter"](0, "Slot B", "Unwatched filler"))
+            self.assertFalse(filter_ns["ItemPassesChannelFilter"](4, "Slot B", "Mask Fragment: Left"))
+            asyncio.run(filter_ns["SendItemBroadcast"](
+                "Slot B found Mask Fragment: Left", "Slot B", "Mask Fragment: Left", {"event": "new filler"}
+            ))
+            sent.assert_awaited_once()
+            self.assertEqual(sent.await_args.args[0], "Slot B found Mask Fragment: Left <@100>")
+            self.assertEqual([user.id for user in sent.await_args.kwargs["allowed_mentions"]["users"]], [100])
+
+    def test_concurrent_same_slot_hints_only_watch_each_requesters_item(self):
+        for user_id, query, expected_id in (
+                (100, "Mask Fragement: Left", 99),
+                (200, "Mask Fragment: Dragon", 100)):
+            with self.subTest(query=query):
+                client_type, ns = load_hint_client({})
+                ns["LookupSlot"] = lambda slot_id: "Slot B"
+                client = client_type.__new__(client_type)
+                client.is_closed = threading.Event()
+                client.request_context = {
+                    "requester_id": user_id, "registered_at_request": True,
+                    "slot": "Slot B", "item": query,
+                }
+                client.hintqueuepayload = query
+                packets = [{"cmd": "Connected", "team": 0, "slot": 2}] + [
+                    {"cmd": "PrintJSON", "type": "Hint", "receiving": 2, "found": False,
+                     "item": {"item": item_id, "location": item_id, "player": 1, "flags": 0}}
+                    for item_id in (99, 100, 1)
+                ]
+                client.ap_connection = Mock()
+                client.ap_connection.recv.side_effect = lambda timeout=None: (
+                    client.is_closed.set(), json.dumps(packets)
+                )[1]
+                client.run()
+                events = [message["data"] for message in ns["chat_queue"].messages
+                          if message["type"] == "HINT_WATCH_RESOLVED"]
+                self.assertEqual([event["hint"]["item"] for event in events], [expected_id])
+                self.assertEqual(events[0]["request_context"]["requester_id"], user_id)
+
+    def test_watch_resolution_rejects_wrong_receiver_and_found_hints(self):
+        client_type, ns = load_hint_client({})
+        ns["LookupSlot"] = lambda slot_id: "Slot B" if str(slot_id) == "2" else "NULL"
+        context = {"requester_id": 100, "registered_at_request": True, "slot": "Slot B", "item": "Map"}
+        for receiver, found in ((3, False), (2, True), (2, None)):
+            client = client_type.__new__(client_type)
+            client.is_closed = threading.Event()
+            client.team = None
+            client.connected_slot = None
+            client.request_context = context
+            client.hintqueuepayload = "Map"
+            client.ap_connection = Mock()
+            response = {"cmd": "PrintJSON", "type": "Hint", "receiving": receiver, "found": found,
+                        "item": {"item": 1, "location": 42, "player": 1, "flags": 0}, "data": []}
+            packets = [{"cmd": "Connected", "team": 0, "slot": 2}]
+            if found is not None:
+                packets.append(response)
+            else:
+                packets.append({"cmd": "PrintJSON", "type": "CommandResult", "data": [{"text": "No hint found."}]})
+            client.ap_connection.recv = Mock(side_effect=lambda timeout=None, packets=packets: (
+                client.is_closed.set(), json.dumps(packets)
+            )[1])
+            client.run()
+        self.assertFalse(any(message["type"] == "HINT_WATCH_RESOLVED" for message in ns["chat_queue"].messages))
+
 
 class HintRelayStartupAndQueueTests(unittest.TestCase):
     def setUp(self):
@@ -753,6 +884,77 @@ class HintRelayStartupAndQueueTests(unittest.TestCase):
         self.assertEqual(len(state.deadletter_items()), 1)
         self.assertEqual(len(logs), 1)
         self.assertIn("HTTP 400", logs[0])
+
+    def test_watch_resolution_is_dispatched_with_hint_announcements_disabled(self):
+        event = {"type": "HINT_WATCH_RESOLVED", "data": {"hint": {}, "request_context": {}, "slot": "Slot B"}}
+        queue = type("FakeQueue", (), {
+            "__init__": lambda self: setattr(self, "items", [event]),
+            "empty": lambda self: not self.items,
+            "get": lambda self: self.items.pop(0),
+        })()
+        handler = AsyncMock()
+        namespace = {
+            "CoreConfig": {"RelayConfig": {"HintMessages": False}},
+            "chat_queue": queue,
+            "HandleHintRelayMessage": handler,
+            "WriteToErrorLog": Mock(),
+            "SendDebugChannelMessage": AsyncMock(),
+            "SendMainChannelMessage": AsyncMock(),
+        }
+        load_bridge_functions({"ProcessChatQueue"}, namespace)
+        asyncio.run(namespace["ProcessChatQueue"]())
+        handler.assert_awaited_once_with(event)
+
+    def test_resolved_watch_requires_requester_to_remain_registered_for_requested_slot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = ItemNotificationState(os.path.join(directory, "items.json"))
+            state.bind_registration(100, "Alice", ["Slot B"])
+            Path(directory, "Alice.json").write_text('["Slot B"]', encoding="utf-8")
+            Path(directory, "Bob.json").write_text('["Slot B"]', encoding="utf-8")
+            event = {"type": "HINT_WATCH_RESOLVED", "data": {
+                "hint": {"receiving_player": 2, "item": 99}, "slot": "Slot B",
+                "request_context": {"requester_id": 100, "registered_at_request": True},
+            }}
+            ns = load_bridge_functions({"HandleHintRelayMessage"}, {
+                "RegisteredUserIDsForSlot": lambda slot: state.registered_user_ids(slot, directory),
+                "LookupGame": lambda slot_id: "Test Game",
+                "LookupItem": lambda game, item_id: "Map",
+                "GetItemNotificationState": lambda: state,
+                "ReportHintRelayDeliveryIssue": Mock(),
+            })
+            asyncio.run(ns["HandleHintRelayMessage"](event))
+            self.assertEqual(state.watches(100), [{"slot": "Slot B", "item": "Map"}])
+
+            # A live registration recheck blocks a result after revocation, and
+            # a requester ID mismatch never transfers the watch to another registrant.
+            state.remove_watch(100, "Slot B", "Map")
+            Path(directory, "Alice.json").write_text("[]", encoding="utf-8")
+            asyncio.run(ns["HandleHintRelayMessage"](event))
+            self.assertEqual(state.watches(100), [])
+            Path(directory, "Alice.json").write_text('["Slot B"]', encoding="utf-8")
+            event["data"]["request_context"]["requester_id"] = 200
+            asyncio.run(ns["HandleHintRelayMessage"](event))
+            self.assertEqual(state.watches(100), [])
+
+    def test_unknown_canonical_item_does_not_create_watch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = ItemNotificationState(os.path.join(directory, "items.json"))
+            state.bind_registration(100, "Alice", ["Slot B"])
+            Path(directory, "Alice.json").write_text('["Slot B"]', encoding="utf-8")
+            namespace = {
+                "RegisteredUserIDsForSlot": lambda slot: state.registered_user_ids(slot, directory),
+                "LookupGame": lambda slot_id: "Test Game",
+                "LookupItem": lambda game, item_id: "NULL",
+                "GetItemNotificationState": lambda: state,
+                "ReportHintRelayDeliveryIssue": Mock(),
+            }
+            load_bridge_functions({"HandleHintRelayMessage"}, namespace)
+            event = {"type": "HINT_WATCH_RESOLVED", "data": {
+                "hint": {"receiving_player": 2, "item": 999}, "slot": "Slot B",
+                "request_context": {"requester_id": 100, "registered_at_request": True},
+            }}
+            asyncio.run(namespace["HandleHintRelayMessage"](event))
+            self.assertEqual(state.watches(100), [])
 
 
 if __name__ == "__main__":

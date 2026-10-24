@@ -38,15 +38,24 @@ default; `CommandConfig` can disable either one.
 Use the exact slot and item names; matching ignores case. Watches require
 registration for the slot and an item known to that slot's game. Multiple
 people can register for the same slot and keep independent preferences.
-A Discord `$hint` or `/hint` request also adds a watch for a recognized item
-in your registered slot. Hinting still has the normal server hint cost;
+A Discord `$hint` or `/hint` request also adds a watch when Archipelago returns
+an unresolved hint for an item in your registered slot. Hinting still has the normal server hint cost;
 watching alone does not reveal an item's location.
 
-Automatic watches apply to Discord hint requests with a recognized item name.
-They are added when the request is queued, even if the server later declines
-the hint, for example because the slot lacks points. Hints requested directly
-from an Archipelago game client do not create a personal watch; use `/watch`
-for those. Existing hint-result announcements continue as before.
+Automatic watches use the canonical item returned by Archipelago, rather than
+the text you typed. For example, if the server resolves `Mask Fragement: Left`
+to `Mask Fragment: Left`, the watch uses `Mask Fragment: Left`. A declined
+request, a request with no hint result, or a result for an already-found item
+does not create a new watch. This works even when hint-result announcements
+are disabled. Only the requester gets the automatic watch, and they must
+still be registered for the receiving slot when the result is processed.
+Hints requested directly from an Archipelago game client do not create a
+personal watch; use `/watch` for those.
+
+Resolved results are also matched to the requested item, so an unrelated hint
+for the same slot cannot create a watch during a concurrent request. If a
+query is ambiguous or refers to a broad item group, automatic watching may
+leave the list unchanged; use `/watch` with the exact item name in that case.
 
 ## Delivery and storage
 
@@ -61,11 +70,17 @@ Ordinary item posts keep the pings on the same message. Discord notification
 preferences can still suppress push alerts even when a mention is present;
 see [Discord's allowed mentions reference](https://docs.discord.com/developers/resources/message#allowed-mentions-object).
 
-Watches do not override `BotItemFilterLevel`, trap spoiler settings, or
-`SnoozeCompletedGames`. An item hidden by those settings produces no channel
-post or ping. Observing its arrival still completes the matching watch.
-Likewise, a matching arrival completes a watch while pings are globally
-disabled or the player has selected `off`.
+A currently registered player's pending watch overrides `BotItemFilterLevel`.
+For example, a watched filler item is posted even in a progression-only
+channel. The override does not require ping consent: a player with mode `off`
+still requests a channel post by watching an item. Mentions continue to require
+both global enablement and the recipient's explicit `all` or `watched` mode.
+Unwatched items keep the configured channel filter.
+
+The separate pure-trap spoiler setting and `SnoozeCompletedGames` still apply.
+An item hidden by those settings produces no channel post or ping. Observing
+its arrival still completes the matching watch. Likewise, a matching arrival
+completes a watch while pings are globally disabled or the player has selected `off`.
 
 Preferences and watches are stored under the session's ignored registration
 data, keyed by stable Discord user ID. They survive restarts and are separate

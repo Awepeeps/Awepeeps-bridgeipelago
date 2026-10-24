@@ -47,6 +47,7 @@ class FakeFollowup:
 
 
 class FakeUser:
+    id = 1234
     def __str__(self):
         return "Player#1234"
 
@@ -64,6 +65,7 @@ class PlayerCommandTests(unittest.TestCase):
         self.tree = FakeTree()
         self.queue = queue.Queue()
         self.calls = []
+        self.bound_registrations = []
         async def callback(name, *args):
             self.calls.append((name, args))
         self.callbacks = {
@@ -77,6 +79,7 @@ class PlayerCommandTests(unittest.TestCase):
             "hint_queue": lambda: self.queue,
             "can_hint": lambda user, slot: True,
             "is_registered_for_slot": lambda user, slot: True,
+            "bind_registration": lambda user: self.bound_registrations.append(user),
             "checkcount": lambda *args: callback("checkcount", *args),
             "checkgraph": lambda *args: callback("checkgraph", *args),
             "deathcount": lambda *args: callback("deathcount", *args),
@@ -165,8 +168,13 @@ class PlayerCommandTests(unittest.TestCase):
         self.assertTrue(interaction.followup.messages[0][1])
 
     def test_hint_is_queued_and_groupcheck_reuses_callback(self):
-        self.call("hint", " Slot A ", " Item B ")
-        self.assertEqual(self.queue.get_nowait(), ["Slot A", "Item B"])
+        interaction = self.call("hint", " Slot A ", " Item B ")
+        queued = self.queue.get_nowait()
+        self.assertEqual((queued["slot"], queued["item"]), ("Slot A", "Item B"))
+        self.assertEqual(queued["request_context"], {
+            "requester_id": 1234, "requester_name": "Player#1234", "registered_at_request": True,
+        })
+        self.assertEqual(self.bound_registrations, [interaction.user])
         empty = self.call("hint", " ", "Item B")
         self.assertEqual(empty.response.messages[0][0], "Both slot and item are required.")
         self.assertTrue(self.queue.empty())

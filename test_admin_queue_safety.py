@@ -173,7 +173,21 @@ class TextHintTests(unittest.TestCase):
     def test_text_hint_with_slot_and_item_is_queued(self):
         # Positive control for the empty-field checks above.
         ns = self.run_as("$hint Slot A | Item B")
-        ns["hint_queue"].put.assert_called_once_with(["Slot A", "Item B"])
+        queued = ns["hint_queue"].put.call_args.args[0]
+        self.assertEqual((queued["slot"], queued["item"]), ("Slot A", "Item B"))
+
+    def test_text_hint_captures_registered_requester_before_queueing_without_arming_watch(self):
+        ns = load_on_message()
+        author = fake_member()
+        author.id = 100
+        ns["IsRegisteredForSlot"].return_value = True
+        asyncio.run(ns["on_message"](fake_message("$hint Slot A | Mask Fragement: Left", author)))
+        queued = ns["hint_queue"].put.call_args.args[0]
+        self.assertEqual(queued["request_context"], {
+            "requester_id": 100, "requester_name": str(author), "registered_at_request": True,
+        })
+        ns["BindItemNotificationRegistration"].assert_called_once_with(author)
+        ns["UpdateItemWatch"].assert_not_called()
 
     def test_text_hint_over_100_characters_is_refused(self):
         for content in ("$hint " + "S" * 101 + " | Item B", "$hint Slot A | " + "I" * 101):
@@ -185,7 +199,8 @@ class TextHintTests(unittest.TestCase):
 
     def test_text_hint_accepts_exactly_100_characters(self):
         ns = self.run_as("$hint " + "S" * 100 + " | " + "I" * 100)
-        ns["hint_queue"].put.assert_called_once_with(["S" * 100, "I" * 100])
+        queued = ns["hint_queue"].put.call_args.args[0]
+        self.assertEqual((queued["slot"], queued["item"]), ("S" * 100, "I" * 100))
 
 
 class CanRequestHintTests(unittest.TestCase):
@@ -716,7 +731,8 @@ class SlashHintTests(unittest.TestCase):
         tree, hint_queue = load_hint_tree()
         interaction = SimpleNamespace(channel_id=42, user=FakeUser(), response=FakeHintResponse())
         asyncio.run(tree.commands["hint"](interaction, " Slot A ", " Item B "))
-        self.assertEqual(hint_queue.get_nowait(), ["Slot A", "Item B"])
+        queued = hint_queue.get_nowait()
+        self.assertEqual((queued["slot"], queued["item"]), ("Slot A", "Item B"))
 
     def test_hint_request_confirmation_is_public_and_names_requester(self):
         tree, _ = load_hint_tree()
@@ -750,7 +766,8 @@ class SlashHintTests(unittest.TestCase):
         tree, hint_queue = load_hint_tree()
         interaction = SimpleNamespace(channel_id=42, user=FakeUser(), response=FakeHintResponse())
         asyncio.run(tree.commands["hint"](interaction, "S" * 100, "I" * 100))
-        self.assertEqual(hint_queue.get_nowait(), ["S" * 100, "I" * 100])
+        queued = hint_queue.get_nowait()
+        self.assertEqual((queued["slot"], queued["item"]), ("S" * 100, "I" * 100))
 
 
 if __name__ == "__main__":

@@ -9,20 +9,71 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from modules.item_notifications import ItemNotificationState
+from modules.item_notifications import ItemNotificationState, resolved_hint_matches
 
 ROOT = Path(__file__).resolve().parent
 SOURCE = ast.parse((ROOT / "bridgeipelago.py").read_text(encoding="utf-8"))
 
 
 def load_functions(*names):
-    nodes = [node for node in SOURCE.body if getattr(node, "name", None) in names]
+    selected = set(names)
+    if selected.intersection({"SendItemBroadcast", "RecordFilteredItemArrival"}):
+        selected.add("ItemEventKey")
+    nodes = [node for node in SOURCE.body if getattr(node, "name", None) in selected]
     namespace = {"json": json, "hashlib": hashlib}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "bridgeipelago.py", "exec"), namespace)
     return namespace
 
 
 class ItemNotificationWiringTests(unittest.TestCase):
+    def test_hint_correlation_reads_actual_datapackage_item_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory, "games.json")
+            path.write_text(json.dumps({"Test Game": {"item_name_to_id": {
+                "Mask Fragment: Left": 99, "Mask Fragment: Dragon": 100,
+            }}}), encoding="utf-8")
+            ns = load_functions("HintWatchMatchesRequest")
+            ns.update({"LookupGame": lambda slot: "Test Game", "GetCoreFiles": lambda key: str(path),
+                       "resolved_hint_matches": resolved_hint_matches})
+            context = {"item": "Mask Fragement: Left"}
+            self.assertTrue(ns["HintWatchMatchesRequest"](context, {"receiving_player": 2, "item": 99}))
+            self.assertFalse(ns["HintWatchMatchesRequest"](context, {"receiving_player": 2, "item": 100}))
+
+    def test_watch_override_does_not_replay_a_previously_recorded_filler_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = ItemNotificationState(os.path.join(directory, "state.json"))
+            state.bind_registration(100, "Alice", ["Slot A"])
+            event = {"data": [{"text": "previous filler"}]}
+            event_key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode()).hexdigest()
+            state.complete_delivery(event_key, "Slot A", "Map", [100])
+            state.add_watch(100, "Slot A", "Map")
+            ns = load_functions("ItemEventKey", "HasActiveItemWatch", "ItemPassesChannelFilter")
+            ns.update({
+                "GetItemNotificationState": lambda: state,
+                "RegisteredUserIDsForSlot": lambda slot: [100],
+                "CoreConfig": {"ItemFilterConfig": {"BotItemSpoilTraps": False, "BotItemFilterLevel": 2}},
+                "ItemFilter": lambda itemclass, level: bool(itemclass & 1),
+            })
+            self.assertFalse(ns["ItemPassesChannelFilter"](0, "Slot A", "Map", event))
+            self.assertTrue(ns["ItemPassesChannelFilter"](1, "Slot A", "Map", event))
+
+    def test_unavailable_watch_state_keeps_normal_filter_behavior(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "state.json")
+            with open(path, "w", encoding="utf-8") as output:
+                output.write("{broken")
+            state = ItemNotificationState(path)
+            ns = load_functions("ItemEventKey", "HasActiveItemWatch", "ItemPassesChannelFilter")
+            ns.update({
+                "GetItemNotificationState": lambda: state,
+                "RegisteredUserIDsForSlot": lambda slot: [],
+                "CoreConfig": {"ItemFilterConfig": {"BotItemSpoilTraps": False, "BotItemFilterLevel": 2}},
+                "ItemFilter": lambda itemclass, level: bool(itemclass & 1),
+            })
+            self.assertFalse(ns["HasActiveItemWatch"]("Slot A", "Map", {"event": 1}))
+            self.assertFalse(ns["ItemPassesChannelFilter"](0, "Slot A", "Map", {"event": 1}))
+            self.assertTrue(ns["ItemPassesChannelFilter"](1, "Slot A", "Map", {"event": 2}))
+
     def test_preferences_singleton_reloads_when_room_path_changes(self):
         with tempfile.TemporaryDirectory() as directory:
             path = [os.path.join(directory, "room-a.json")]
@@ -58,7 +109,7 @@ class ItemNotificationWiringTests(unittest.TestCase):
                 json.dump(["Slot A"], output)
             state = ItemNotificationState(os.path.join(directory, "state.json"))
             state.bind_registration(100, "Alice", ["Slot A"])
-            state.set_mode(100, "watched")
+            state.set_mode(100, "off")
             state.add_watch(100, "Slot A", "Map")
             sent = AsyncMock()
             mentions = Mock(side_effect=lambda **kwargs: kwargs)
@@ -119,7 +170,8 @@ class ItemNotificationWiringTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = ItemNotificationState(os.path.join(directory, "state.json"))
             state.bind_registration(100, "Alice", ["Slot A"])
-            state.set_mode(100, "all")
+            state.set_mode(100, "watched")
+            state.add_watch(100, "Slot A", "Map")
             sent = AsyncMock()
             allowed = type("AllowedMentions", (), {"none": staticmethod(lambda: {}), "__new__": lambda cls, **kwargs: kwargs})
             ns = load_functions("SendItemBroadcast")

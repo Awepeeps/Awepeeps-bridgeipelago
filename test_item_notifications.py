@@ -4,7 +4,24 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from modules.item_notifications import ItemNotificationState
+from modules.item_notifications import ItemNotificationState, resolved_hint_matches
+
+
+class ResolvedHintMatchingTests(unittest.TestCase):
+    def test_exact_numeric_and_clear_typo_results_match_item_ids(self):
+        names = {"Mask Fragment: Left": 99, "Mask Fragment: Dragon": 100, "Map": 1}
+        for query in ("Mask Fragment: Left", "mask fragment: left", "Mask Fragement: Left", "99"):
+            with self.subTest(query=query):
+                self.assertTrue(resolved_hint_matches(query, 99, names))
+                self.assertFalse(resolved_hint_matches(query, 100, names))
+        self.assertFalse(resolved_hint_matches("999", 999, names))
+
+    def test_ambiguous_or_unrelated_queries_do_not_watch(self):
+        names = {"Sword A": 1, "Sword B": 2}
+        for item_id in (1, 2):
+            self.assertFalse(resolved_hint_matches("Sword", item_id, names))
+            self.assertFalse(resolved_hint_matches("Completely different", item_id, names))
+            self.assertFalse(resolved_hint_matches("", item_id, names))
 
 
 class ItemNotificationTests(unittest.TestCase):

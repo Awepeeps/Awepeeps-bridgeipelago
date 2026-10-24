@@ -121,6 +121,11 @@ track an item without spending hint points. Pings also require the global
 `NotificationConfig.ItemMentionsEnabled` setting (default `false`). See
 [opt-in item pings and watches](docs/item-watches.md) for commands and behavior.
 
+Watched items bypass the channel's item filter level while mentions remain
+opt-in. Discord hints create watches from the server's resolved item, so a
+typo accepted by Archipelago still watches the canonical item. Pure-trap
+spoiler settings and finished-player suppression remain in effect.
+
 |Maintenance Commands|Description|
 |---|---|
 |`$iloveyou`|We all need to hear this sometimes.|

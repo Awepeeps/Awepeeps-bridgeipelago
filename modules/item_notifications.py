@@ -3,6 +3,29 @@
 import json
 import os
 import tempfile
+from difflib import SequenceMatcher
+
+
+def resolved_hint_matches(query, item_id, item_names):
+    """Correlate an actual server result without accepting unrelated slot hints."""
+    query = str(query).strip()
+    if not query or not isinstance(item_names, dict):
+        return False
+    if query.isdecimal():
+        return str(int(query)) == str(item_id) and any(
+            str(value) == str(item_id) for value in item_names.values()
+        )
+    folded = query.casefold()
+    exact = [value for name, value in item_names.items() if name.casefold() == folded]
+    if exact:
+        return any(str(value) == str(item_id) for value in exact)
+    ranked = sorted(
+        ((SequenceMatcher(None, folded, name.casefold()).ratio(), str(value))
+         for name, value in item_names.items()), reverse=True
+    )
+    return bool(ranked) and ranked[0][1] == str(item_id) and ranked[0][0] >= 0.75 and (
+        len(ranked) == 1 or ranked[0][0] - ranked[1][0] > 0.05
+    )
 
 
 class ItemNotificationState:

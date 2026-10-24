@@ -66,7 +66,7 @@ from modules.hint_relay import (
     render_hint_message,
     unused_corrupt_path,
 )
-from modules.item_notifications import ItemNotificationState
+from modules.item_notifications import ItemNotificationState, resolved_hint_matches
 import time
 
 # Bridgeipelago Optional Modules
@@ -622,6 +622,7 @@ class HintClient:
     def __init__(
         self,
         slot_name: str,
+        request_context: dict = None,
         **kwargs: typing.Any
     ) -> None:
         self.server_uri = CoreConfig["ArchipelagoConfig"]['ArchipelagoServer']
@@ -630,11 +631,13 @@ class HintClient:
         self.slot_name = slot_name
         self.verbose_logging = CoreConfig["AdvancedConfig"]["DebugMode"]
         self.ap_connection_kwargs = kwargs
+        self.request_context = request_context
         self.uuid: int = uuid.getnode()
         self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
         self.is_closed = Event()
         self.team = None
+        self.connected_slot = None
         self.hintqueuepayload = hintprocessing_queue.get()
 
     def run(self):
@@ -655,6 +658,7 @@ class HintClient:
                         elif cmd == self.MessageCommand.CONNECTED.value:
                             print("-- HintClient received CONNECTED.")
                             self.team = args.get('team')
+                            self.connected_slot = args.get('slot')
                             self.process_hint()
                         elif cmd == self.MessageCommand.CONNECTIONREFUSED.value:
                             print("HintClient CONNECTION_REFUSED by server - check your slot name / port / whatever, and try again.")
@@ -663,8 +667,18 @@ class HintClient:
                             chat_queue.put(MessageObject)
                         elif cmd == self.MessageCommand.PRINT_JSON.value:
                             if args.get('type') == 'Hint':
+                                hint = normalize_requested_hint(args, self.team)
+                                request_context = getattr(self, "request_context", None)
+                                if (request_context is not None and args.get('found') is not True
+                                        and HintWatchMatchesRequest(request_context, hint)
+                                        and args.get('receiving') == getattr(self, "connected_slot", None)
+                                        and str(LookupSlot(str(getattr(self, "connected_slot", "")))).casefold()
+                                            == str(request_context.get("slot", "")).casefold()):
+                                    chat_queue.put({"type": "HINT_WATCH_RESOLVED", "data": {
+                                        "hint": hint, "request_context": request_context,
+                                        "slot": LookupSlot(str(self.connected_slot)),
+                                    }, "flag": "None"})
                                 if CoreConfig.get("RelayConfig", {}).get("HintMessages", False) is True:
-                                    hint = normalize_requested_hint(args, self.team)
                                     chat_queue.put({"type": "HINT_REQUESTED", "data": hint, "flag": "None"})
                                 else:
                                     chat_queue.put(MessageObject)
@@ -947,6 +961,41 @@ def RegisteredSlotsFor(User):
 def RegisteredUserIDsForSlot(slot):
     return GetItemNotificationState().registered_user_ids(slot, GetCoreDirectory("reg"))
 
+def HintWatchMatchesRequest(context, hint):
+    """Only accept the server's result for the requested item, including clear typos."""
+    try:
+        game = LookupGame(str(hint.get("receiving_player")))
+        with open(GetCoreFiles("archgamedump"), "r", encoding="utf-8") as source:
+            games = json.load(source)
+        return resolved_hint_matches(context.get("item", ""), hint.get("item"),
+                                     games.get(game, {}).get("item_name_to_id", {}))
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+
+def ItemEventKey(event):
+    return hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+def HasActiveItemWatch(slot, item, event=None):
+    """Whether a currently registered user has an active watch, regardless of ping consent."""
+    state = GetItemNotificationState()
+    if not state.available:
+        return False
+    if event is not None and state.was_delivered(ItemEventKey(event)):
+        return False
+    registered = set(str(user_id) for user_id in RegisteredUserIDsForSlot(slot))
+    return any(
+        any(state._same(watch, {"slot": slot, "item": item}) for watch in state.watches(user_id))
+        for user_id in registered
+    )
+
+def ItemPassesChannelFilter(itemclass, slot, item, event=None):
+    """Apply normal item filtering, with active watches overriding only level filtering."""
+    itemclass = int(itemclass)
+    if itemclass == 4:
+        return CoreConfig["ItemFilterConfig"]["BotItemSpoilTraps"] is True
+    return (ItemFilter(itemclass, CoreConfig["ItemFilterConfig"]["BotItemFilterLevel"])
+            or HasActiveItemWatch(slot, item, event))
+
 def IsRegisteredForSlot(User, slot):
     wanted = str(slot).casefold()
     return any(str(value).casefold() == wanted for value in RegisteredSlotsFor(str(User)))
@@ -1118,9 +1167,14 @@ async def on_message(message):
         elif not CanRequestHint(message.author, hintrequest[0]):
             await SendMainChannelMessage(HINT_NOT_REGISTERED_MESSAGE)
         else:
-            if IsRegisteredForSlot(message.author, hintrequest[0]) and IsKnownItemForSlot(hintrequest[0], hintrequest[1]):
-                UpdateItemWatch(message.author, hintrequest[0], hintrequest[1])
-            hint_queue.put(hintrequest)
+            registered_at_request = IsRegisteredForSlot(message.author, hintrequest[0])
+            if registered_at_request:
+                BindItemNotificationRegistration(message.author)
+            hint_queue.put({"slot": hintrequest[0], "item": hintrequest[1], "request_context": {
+                "requester_id": getattr(message.author, "id", None),
+                "requester_name": str(message.author),
+                "registered_at_request": registered_at_request,
+            }})
             await SendMainChannelMessage(str(message.author) + " requested a hint for " + hintrequest[0] + ": " + hintrequest[1])
 
     if message.content.startswith('$deathcount'):
@@ -1360,9 +1414,7 @@ async def ProcessItemQueue():
             if CheckSnoozeStatus(recipient):
                 RecordFilteredItemArrival(recipient, item, itemmessage)
                 await CancelProcess()
-            elif int(itemclass) == 4 and CoreConfig["ItemFilterConfig"]["BotItemSpoilTraps"] == True:
-                await SendItemBroadcast(message, recipient, item, itemmessage)
-            elif int(itemclass) != 4 and ItemFilter(int(itemclass),CoreConfig["ItemFilterConfig"]["BotItemFilterLevel"]):
+            elif ItemPassesChannelFilter(itemclass, recipient, item, itemmessage):
                 await SendItemBroadcast(message, recipient, item, itemmessage)
             else:
                 RecordFilteredItemArrival(recipient, item, itemmessage)
@@ -1462,8 +1514,22 @@ async def DeliverPendingHintResults():
 
 async def HandleHintRelayMessage(message):
     try:
-        state = await InitializeHintRelayState()
         message_type = message.get("type") if isinstance(message, dict) else None
+        if message_type == "HINT_WATCH_RESOLVED":
+            data = message.get("data", {})
+            hint = data.get("hint", {})
+            context = data.get("request_context", {})
+            requester_id = context.get("requester_id")
+            if (context.get("registered_at_request") is True
+                    and str(requester_id).isdigit()
+                    and int(requester_id) in RegisteredUserIDsForSlot(data.get("slot", ""))):
+                canonical_item = LookupItem(LookupGame(str(hint.get("receiving_player"))), hint.get("item"))
+                if canonical_item not in (None, "", "NULL"):
+                    if not GetItemNotificationState().add_watch(
+                            int(requester_id), data.get("slot", ""), canonical_item):
+                        ReportHintRelayDeliveryIssue("could not save resolved item watch")
+            return
+        state = await InitializeHintRelayState()
         if message_type == "HINT_SNAPSHOT":
             data = message.get("data", {})
             if isinstance(data, dict):
@@ -1508,7 +1574,7 @@ async def ProcessChatQueue():
             return
         else:
             Message = chat_queue.get()
-            if Message['type'] in ("HINT_SNAPSHOT", "HINT_REQUESTED"):
+            if Message['type'] in ("HINT_SNAPSHOT", "HINT_REQUESTED", "HINT_WATCH_RESOLVED"):
                 try:
                     await HandleHintRelayMessage(Message)
                 except Exception as e:
@@ -1626,7 +1692,7 @@ async def SendMainChannelMessage(message):
 async def SendItemBroadcast(message, slot, item, event):
     """Post the existing item broadcast with only explicitly opted-in mentions."""
     registered_ids = RegisteredUserIDsForSlot(slot)
-    event_key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    event_key = ItemEventKey(event)
     state = GetItemNotificationState()
     recipients = [] if state.was_delivered(event_key) else state.recipients(slot, item, registered_ids)
     users = [discord.Object(id=user_id) for user_id in recipients]
@@ -1675,7 +1741,7 @@ async def SendItemBroadcast(message, slot, item, event):
 
 def RecordFilteredItemArrival(slot, item, event):
     """Complete matching watches for an item observed but filtered from channel output."""
-    key = hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    key = ItemEventKey(event)
     state = GetItemNotificationState()
     if not state.was_delivered(key):
         state.complete_delivery(key, slot, item, RegisteredUserIDsForSlot(slot))
@@ -2986,9 +3052,18 @@ def main():
             
         if not hint_queue.empty():
             hint_object = hint_queue.get()
-            hintprocessing_queue.put(hint_object[1])
+            if isinstance(hint_object, dict):
+                hint_slot, hint_item = hint_object.get("slot", ""), hint_object.get("item", "")
+                request_context = dict(hint_object.get("request_context") or {})
+            else:
+                hint_slot, hint_item = hint_object[0], hint_object[1]
+                request_context = None
+            if request_context is not None:
+                request_context["slot"] = hint_slot
+                request_context["item"] = hint_item
+            hintprocessing_queue.put(hint_item)
             hint_client = HintClient(
-                slot_name=hint_object[0],
+                slot_name=hint_slot, request_context=request_context,
             )      
             hint_client.start()
             time.sleep(5)

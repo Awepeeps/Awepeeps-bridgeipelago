@@ -147,10 +147,19 @@ def register_player_commands(tree, callbacks, get_broadcast_channel_id):
         if not callbacks["can_hint"](interaction.user, slot):
             await interaction.response.send_message(HINT_NOT_REGISTERED_MESSAGE, ephemeral=True)
             return
-        if (callbacks.get("is_registered_for_slot", lambda _user, _slot: False)(interaction.user, slot)
-                and callbacks.get("is_valid_item", lambda _slot, _item: True)(slot, item)):
-            callbacks.get("add_watch", lambda *_: None)(interaction.user, slot, item)
-        callbacks["hint_queue"]().put([slot, item])
+        registered_at_request = bool(callbacks.get(
+            "is_registered_for_slot", lambda _user, _slot: False
+        )(interaction.user, slot))
+        if registered_at_request:
+            callbacks.get("bind_registration", lambda _user: None)(interaction.user)
+        callbacks["hint_queue"]().put({
+            "slot": slot, "item": item,
+            "request_context": {
+                "requester_id": getattr(interaction.user, "id", None),
+                "requester_name": str(interaction.user),
+                "registered_at_request": registered_at_request,
+            },
+        })
         await interaction.response.send_message(
             str(interaction.user) + " requested a hint for " + slot + ": " + item,
             allowed_mentions=discord.AllowedMentions.none(),

@@ -110,13 +110,22 @@ and announced in the broadcast channel.
 
 ### Reports after release
 
-Scheduled daily reports are skipped once every world on the web tracker's checks
-table has all locations checked or released. This does not require every player
-to report a goal. Manual check-count, check-graph and death-count commands remain
-available. The check uses the read-only tracker (with a 15-second timeout), so it
-does not wake a sleeping room. Missing or invalid tracker data cancels that day's
-scheduled report and is logged; the next day checks again. With `SelfHostNoWeb`,
-completion cannot be determined automatically.
+Scheduled check counts and progress graphs stop once every world on the web
+tracker has all locations checked or released. Death counts stop independently:
+every slot listed in `DailyPostConfig.DeathLinkSlots` must show `Goal Completed`.
+A released world does not by itself count as a completed DeathLink goal.
+
+Set `DeathLinkSlots` to the exact names of every DeathLink-enabled player, for
+example `["Player One", "Player Two"]`. The roster is explicit because disconnected
+clients' DeathLink participation cannot be reliably inferred from online tags or
+the death log. Keep it in sync with the session's enabled settings. `null` or an
+omitted setting means unknown participation, so death counts keep posting; `[]`
+means no DeathLink games, so no scheduled death count is posted. Invalid names or
+malformed tracker data skip that day's reports and log the error.
+
+Manual report commands remain available. The tracker check uses a 15-second
+timeout, does not wake the room, and repeats at the next scheduled time. With
+`SelfHostNoWeb`, completion cannot be determined automatically.
 
 Tracker reconnect failures no longer permanently disable tracking. After three
 failed attempts, retries cool down to once per minute and one unavailable notice is

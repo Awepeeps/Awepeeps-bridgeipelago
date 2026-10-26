@@ -67,7 +67,7 @@ from modules.hint_relay import (
     unused_corrupt_path,
 )
 from modules.room_endpoint import resolve_port, verify_seed
-from modules.report_completion import all_locations_checked
+from modules.report_completion import all_locations_checked, deathlink_games_finished
 from modules.tracker_recovery import TrackerRecovery
 from modules.item_notifications import ItemNotificationState, resolved_hint_matches
 import time
@@ -811,28 +811,25 @@ class HintClient:
 
 
 ## DISCORD EVENT HANDLERS + CORE FUNTION
-async def AllGamesReleased():
+async def DailyReportCompletion():
     if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"]:
-        return False
+        return False, False
     page = await asyncio.to_thread(
         requests.get, CoreConfig["ArchipelagoConfig"]["ArchipelagoTrackerURL"], timeout=15,
     )
     page.raise_for_status()
-    return all_locations_checked(page.content)
+    return (all_locations_checked(page.content),
+            deathlink_games_finished(page.content, CoreConfig.get("DailyPostConfig", {}).get("DeathLinkSlots")))
 
 
 async def PostDailyStats():
-    # A release checks every remaining location. Goals alone do not establish
-    # that there are no items left to send. Manual reports remain available.
-    if await AllGamesReleased():
-        print("++ Daily reports skipped: every world's locations are checked or released.")
-        return
+    progress_finished, deathlink_finished = await DailyReportCompletion()
     failures = []
-    reports = (
-        ("check count", Command_CheckCount),
-        ("check graph", Command_CheckGraph),
-        ("death count", Command_DeathCount),
-    )
+    reports = []
+    if not progress_finished:
+        reports.extend((("check count", Command_CheckCount), ("check graph", Command_CheckGraph)))
+    if not deathlink_finished:
+        reports.append(("death count", Command_DeathCount))
     # Try every report even if one fails, so a broken report does not
     # hide the other one. The scheduler logs the raised error and tries again
     # at the next day's scheduled time rather than retrying later today.

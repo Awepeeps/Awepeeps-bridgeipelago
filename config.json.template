@@ -54,7 +54,8 @@
     "DailyPostConfig": {
         "Enabled": false,
         "Time": "00:00",
-        "Timezone": "America/New_York"
+        "Timezone": "America/New_York",
+        "DeathLinkSlots": null
     },
     "CommandConfig": {
         "PrefixCommandsEnabled": true,

@@ -178,3 +178,16 @@ If at any time this process breaks or throws an error here are some common troub
 
 If none of this works, poke in the discord for help and someone will get you sorted. :)
 
+### Reports after release
+
+Scheduled daily reports are skipped once every world on the web tracker's checks
+table has all locations checked or released. This does not require every player
+to report a goal. Manual check-count, check-graph and death-count commands remain
+available. The check uses the read-only tracker (with a 15-second timeout), so it
+does not wake a sleeping room. Missing or invalid tracker data cancels that day's
+scheduled report and is logged; the next day checks again. With `SelfHostNoWeb`,
+completion cannot be determined automatically.
+
+Tracker reconnect failures no longer permanently disable tracking. After three
+failed attempts, retries cool down to once per minute and one error notice is
+sent per outage; a successful connection resets that warning.

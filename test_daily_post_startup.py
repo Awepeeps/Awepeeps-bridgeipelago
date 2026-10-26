@@ -17,7 +17,7 @@ def load_start_daily_post_scheduler():
     tree = ast.parse((ROOT / "bridgeipelago.py").read_text(encoding="utf-8"))
     names = {"StartDailyPostScheduler", "PostDailyStats", "ReportDailyPostError"}
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
-    namespace = {}
+    namespace = {"AllGamesReleased": AsyncMock(return_value=False)}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "bridgeipelago.py", "exec"), namespace)
     return namespace["StartDailyPostScheduler"], namespace
 

@@ -84,6 +84,20 @@ Hopefully that makes sense.
 ---
 ---
 
+### Reports after release
+
+Scheduled daily reports are skipped once every world on the web tracker's checks
+table has all locations checked or released. This does not require every player
+to report a goal. Manual check-count, check-graph and death-count commands remain
+available. The check uses the read-only tracker (with a 15-second timeout), so it
+does not wake a sleeping room. Missing or invalid tracker data cancels that day's
+scheduled report and is logged; the next day checks again. With `SelfHostNoWeb`,
+completion cannot be determined automatically.
+
+Tracker reconnect failures no longer permanently disable tracking. After three
+failed attempts, retries cool down to once per minute and one error notice is
+sent per outage; a successful connection resets that warning.
+
 ## Commands
 For item flag values, channel filter levels, traps, finished-player suppression,
 and how channel posts differ from personal DMs, see [Item notification filters](docs/item-notifications.md).

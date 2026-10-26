@@ -66,6 +66,8 @@ from modules.hint_relay import (
     render_hint_message,
     unused_corrupt_path,
 )
+from modules.report_completion import all_locations_checked
+from modules.tracker_recovery import TrackerRecovery
 from modules.item_notifications import ItemNotificationState, resolved_hint_matches
 import time
 
@@ -360,6 +362,7 @@ class TrackerClient():
         self.ap_connection: ClientConnection = None
         self.socket_thread: Thread = None
         self.is_closed = Event()
+        self.has_connected = False
         self.hint_baseline_keys = set()
         self.hint_store_keys = set()
         self.hint_prebaseline_replies = {}
@@ -395,6 +398,7 @@ class TrackerClient():
                         elif cmd == self.MessageCommand.DATA_PACKAGE.value:
                             WriteDataPackage(args)
                         elif cmd == self.MessageCommand.CONNECTED.value:
+                            self.has_connected = True
                             QueueRoomWakeNotice()
                             WriteArchConnectionJSON(args)
                             print("-- Tracker connected to server.")
@@ -586,6 +590,7 @@ class TrackerClient():
         try:
             _ConnectionString = str(CoreConfig["ArchipelagoConfig"]['ArchipelagoServer']) + ":" + str(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'])
             self.is_closed.clear()
+            self.has_connected = False
             self.ap_connection = connect(
                 _ConnectionString,
                 max_size=None,
@@ -772,7 +777,22 @@ class HintClient:
 
 
 ## DISCORD EVENT HANDLERS + CORE FUNTION
+async def AllGamesReleased():
+    if CoreConfig["AdvancedConfig"]["SelfHostNoWeb"]:
+        return False
+    page = await asyncio.to_thread(
+        requests.get, CoreConfig["ArchipelagoConfig"]["ArchipelagoTrackerURL"], timeout=15,
+    )
+    page.raise_for_status()
+    return all_locations_checked(page.content)
+
+
 async def PostDailyStats():
+    # A release checks every remaining location. Goals alone do not establish
+    # that there are no items left to send. Manual reports remain available.
+    if await AllGamesReleased():
+        print("++ Daily reports skipped: every world's locations are checked or released.")
+        return
     failures = []
     reports = (
         ("check count", Command_CheckCount),
@@ -2982,30 +3002,28 @@ def main():
     DiscordThread.start()
 
     DiscordCycleCount = 0
-    TrackerCycleCount = 0
-    
+    TrackerRetries = TrackerRecovery()
+
     ## Gotta keep the bot running!
     while True:
-        if TrackerCycleCount >= 3:
-            print("!!! Tracker has crtically failed to restart multiple times")
-            print("!!! Exiting for manual intervention")
-            MessageObject = {"type": "CORE", "data": {"text": "[CORE]: ERROR - Tracker has crtically failed to restart multiple times. Manual intervention required."}, "flag": "ERROR"}
-            chat_queue.put(MessageObject)
-            ToggleConfig["CrippleTracker"] = True
-            TrackerCycleCount = 0
-        
+        if not CoreConfig["AdvancedConfig"]["DiscordJoinOnly"] and tracker_client.has_connected:
+            TrackerRetries.connected()
+
         if (CoreConfig["AdvancedConfig"]["DiscordJoinOnly"] == False):
-            if not ToggleConfig["CrippleTracker"]:  
+            if not ToggleConfig["CrippleTracker"] and TrackerRetries.ready(time.monotonic()):
                 if not tracker_client.socket_thread.is_alive() or not websocket_queue.empty() or not seppuku_queue.empty():
                     print("-- Tracker is not running, requested a restart, or has failed, so we do the needful")
 
+                    tracker_client.has_connected = False
+                    if TrackerRetries.failed(time.monotonic()):
+                        chat_queue.put({"type": "CORE", "data": {"text":
+                            "[CORE]: ERROR - Tracker could not reconnect after multiple attempts. Retrying automatically every 60 seconds."}, "flag": "ERROR"})
                     if not seppuku_queue.empty():
                         print("-- Tracker commited Seppuku, Requesting new port information")
                         print("-- Sleeping for 5 seconds to allow DiscordBot to process PortScan")
                         with ToggleLock:
                             ToggleConfig["RequestPortScan"] = True
                         time.sleep(5)
-                        TrackerCycleCount = TrackerCycleCount + 1
 
                     while not websocket_queue.empty():
                         SQMessage = websocket_queue.get()

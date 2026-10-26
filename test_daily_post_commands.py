@@ -27,7 +27,7 @@ def load_commands():
     tree = ast.parse((ROOT / "bridgeipelago.py").read_text(encoding="utf-8"))
     names = {"Command_DeathCount", "Command_CheckCount", "Command_CheckGraph", "PostDailyStats"}
     nodes = [node for node in tree.body if getattr(node, "name", None) in names]
-    namespace = {}
+    namespace = {"AllGamesReleased": AsyncMock(return_value=False)}
     exec(
         compile(ast.Module(body=nodes, type_ignores=[]), "bridgeipelago.py", "exec"),
         namespace,

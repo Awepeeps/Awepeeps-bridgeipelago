@@ -41,6 +41,8 @@ def load_tracker_client():
     tree = ast.parse((ROOT / "bridgeipelago.py").read_text())
     node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == "TrackerClient")
     namespace = {
+        "resolve_port": lambda *args: 38281,
+        "requests": SimpleNamespace(get=Mock()),
         "CoreConfig": {
             "ArchipelagoConfig": {"ArchipelagoServer": "localhost", "ArchipelagoPort": 38281, "ArchipelagoBotSlot": "bot"},
             "AdvancedConfig": {"DebugMode": False, "QueueOverclock": 1},

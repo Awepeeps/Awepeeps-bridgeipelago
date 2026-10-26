@@ -178,6 +178,30 @@ If at any time this process breaks or throws an error here are some common troub
 
 If none of this works, poke in the discord for help and someone will get you sorted. :)
 
+### Hosted room reconnects and seed identity
+
+Set `ArchipelagoConfig.ExpectedSeedName` in local `config.json` to the exact
+`seed_name` of the intended seed before starting the bot. For a locally generated
+seed archive, this is the name between `AP_` and `.archipelago` in its multidata
+filename. Confirm it against your original seed; do not copy an identity from an
+unverified server at an old port. Update it when intentionally changing seeds.
+The generic template contains a placeholder, not a usable seed identity.
+
+Before every tracker or hint-client connection, the bot queries the room-status
+API with a 10-second timeout and uses its latest port. An API failure postpones
+the attempt instead of using a stale port. A sleeping room can retain its old
+port in that API, so the bot also checks `RoomInfo.seed_name` before sending login
+credentials or replacing cached room data. Missing or mismatched identities
+refuse login. Self-hosted rooms skip the API and use the configured port, but
+still require the seed identity check.
+
+Endpoint lookups never open `/room/` or wake the room. Discord remains available
+while connection attempts fail, including at startup. After repeated failures,
+the bot retries once per minute and posts one configured unavailable notice;
+a verified successful login posts the matching recovery notice. The periodic
+port poll remains as an additional check. A changed port is saved to local config
+and announced in the broadcast channel.
+
 ### Reports after release
 
 Scheduled daily reports are skipped once every world on the web tracker's checks
@@ -189,5 +213,5 @@ scheduled report and is logged; the next day checks again. With `SelfHostNoWeb`,
 completion cannot be determined automatically.
 
 Tracker reconnect failures no longer permanently disable tracking. After three
-failed attempts, retries cool down to once per minute and one error notice is
+failed attempts, retries cool down to once per minute and one unavailable notice is
 sent per outage; a successful connection resets that warning.

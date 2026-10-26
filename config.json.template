@@ -11,6 +11,7 @@
         "ArchipelagoPort": 12345,
         "ArchipelagoPassword": "<your_archipelago_password>",
         "ArchipelagoBotSlot": "Bridgeipelago",
+        "ExpectedSeedName": "<seed_name_from_your_seed>",
         "ArchipelagoTrackerURL": "https://Archipelago.gg/tracker/<customURLhere>",
         "ArchipelagoServerURL": "https://archipelago.gg/room/<customURLhere>",
         "UniqueID": "1234567890"

@@ -27,6 +27,8 @@ def load_tracker_client():
         or (isinstance(node, ast.ClassDef) and node.name == "TrackerClient")
     ]
     namespace = {
+        "resolve_port": lambda *args: 38281,
+        "requests": SimpleNamespace(get=Mock()),
         "CoreConfig": {"ArchipelagoConfig": {
             "ArchipelagoServer": "localhost", "ArchipelagoPort": 38281,
             "ArchipelagoBotSlot": "bot", "ArchipelagoServerURL": "https://archipelago.gg/room/abc",

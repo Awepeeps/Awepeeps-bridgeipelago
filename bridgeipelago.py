@@ -66,6 +66,7 @@ from modules.hint_relay import (
     render_hint_message,
     unused_corrupt_path,
 )
+from modules.room_endpoint import resolve_port, verify_seed
 from modules.report_completion import all_locations_checked
 from modules.tracker_recovery import TrackerRecovery
 from modules.item_notifications import ItemNotificationState, resolved_hint_matches
@@ -392,6 +393,11 @@ class TrackerClient():
                             print(RawMessage)
                             
                         if cmd == self.MessageCommand.ROOM_INFO.value:
+                            try:
+                                verify_seed(CoreConfig["ArchipelagoConfig"], args)
+                            except ValueError:
+                                self.ap_connection.close()
+                                raise
                             WriteRoomInfo(args)
                             self.check_datapackage()
                             self.send_connect()
@@ -473,16 +479,22 @@ class TrackerClient():
                             WriteToErrorLog("Websocket", "Tracker Unhandled Message: " + str(args))
                         pass
                 except websockets.exceptions.ConnectionClosedError as e:
+                    if self.is_closed.is_set():
+                        break
                     WriteToErrorLog("Websocket", "Tracker ConnectionClosedError: " + str(e))
                     QueueRoomSleepNotice(getattr(e, "rcvd", None))
                     websocket_queue.put("!! Tracker ConnectionClosedError ...")
                     break
                 except websockets.exceptions.ConnectionClosed as e:
+                    if self.is_closed.is_set():
+                        break
                     WriteToErrorLog("Websocket", "Tracker ConnectionClosed: " + str(e))
                     QueueRoomSleepNotice(getattr(e, "rcvd", None))
                     websocket_queue.put("!! Tracker ConnectionClosed ...")
                     break
                 except websockets.exceptions.InvalidState as e:
+                    if self.is_closed.is_set():
+                        break
                     WriteToErrorLog("Websocket", "Tracker InvalidState: " + str(e))
                     websocket_queue.put("!! Tracker InvalidState ...")
                     break
@@ -583,12 +595,22 @@ class TrackerClient():
 
     def stop(self) -> None:
         self.is_closed.set()
-        self.ap_connection.close()
+        if self.ap_connection is not None:
+            self.ap_connection.close()
+        if self.socket_thread is not None:
+            self.socket_thread.join(timeout=5)
 
     def start(self) -> None:
         print("-- Attempting to open an Archipelago MultiServer websocket connection in a new thread.")
         try:
-            _ConnectionString = str(CoreConfig["ArchipelagoConfig"]['ArchipelagoServer']) + ":" + str(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'])
+            Port = resolve_port(CoreConfig["ArchipelagoConfig"],
+                                CoreConfig["AdvancedConfig"].get("SelfHostNoWeb", False), requests.get)
+            if Port != int(CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]):
+                SetConfigVariable("ArchipelagoPort", Port)
+                Host = CoreConfig["ArchipelagoConfig"]["ArchipelagoServer"].split("://")[-1]
+                chat_queue.put({"type": "CORE", "data": {"text":
+                    "The Archipelago room moved to a new port. Reconnect to **" + Host + ":" + str(Port) + "**"}, "flag": "PORT_CHANGE"})
+            _ConnectionString = str(CoreConfig["ArchipelagoConfig"]['ArchipelagoServer']) + ":" + str(Port)
             self.is_closed.clear()
             self.has_connected = False
             self.ap_connection = connect(
@@ -658,6 +680,11 @@ class HintClient:
                         cmd = args.get('cmd')
                         MessageObject = {"type": "HTMessage", "data": args, "flag": "None"}
                         if cmd == self.MessageCommand.ROOM_INFO.value:
+                            try:
+                                verify_seed(CoreConfig["ArchipelagoConfig"], args)
+                            except ValueError:
+                                self.ap_connection.close()
+                                raise
                             print("-- HintClient received ROOM_INFO sending CONNECT.")
                             self.send_connect()
                         elif cmd == self.MessageCommand.CONNECTED.value:
@@ -752,7 +779,14 @@ class HintClient:
         
         print("-- Attempting to open an HintClient connection in a new thread.")
         try:
-            _ConnectionString = str(CoreConfig["ArchipelagoConfig"]['ArchipelagoServer']) + ":" + str(CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'])
+            Port = resolve_port(CoreConfig["ArchipelagoConfig"],
+                                CoreConfig["AdvancedConfig"].get("SelfHostNoWeb", False), requests.get)
+            if Port != int(CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]):
+                SetConfigVariable("ArchipelagoPort", Port)
+                Host = CoreConfig["ArchipelagoConfig"]["ArchipelagoServer"].split("://")[-1]
+                chat_queue.put({"type": "CORE", "data": {"text":
+                    "The Archipelago room moved to a new port. Reconnect to **" + Host + ":" + str(Port) + "**"}, "flag": "PORT_CHANGE"})
+            _ConnectionString = str(CoreConfig["ArchipelagoConfig"]['ArchipelagoServer']) + ":" + str(Port)
             self.ap_connection = connect(
                 _ConnectionString,
                 max_size=None,
@@ -2941,6 +2975,7 @@ def main():
     global ReconnectionTimer
     global discord_client
     global tracker_client
+    global ConnectionUnavailableSince
 
     # Version Checking against GitHub
     try:
@@ -2973,30 +3008,9 @@ def main():
             seppuku_queue.put("Tracker Client can't start! Seppuku initiated.")
         time.sleep(5)
 
-        if not CheckDatapackage():
-            print("!!! Critical Error - Data package is not valid! Restarting the bot normally fixes this issue.")
-            seppuku_queue.put("Data package is not valid!")
-
-        # If there is a critical error in the tracker_client, kill the script.
-        if not seppuku_queue.empty() or not websocket_queue.empty():
-            print("!! Early Loading Seppuku Initiated - Goodbye Friend")
-            exit(1)
-
-        # Since there wasn't a critical error, continue as normal :)
-        print("== Loading Arch Data...")
-
-        # Wait for game dump to be created by tracker client
-        while not CheckGameDump():
-            print("== waiting for " + GetCoreFiles("archgamedump") + " to be created on when data package is received")
-            time.sleep(2)
-
-        # Wait for connection dump to be created by tracker client
-        while not CheckConnectionDump():
-            print("== waiting for " + GetCoreFiles("archconnectiondump") + " to be created on room connection")
-            time.sleep(2)
-
-        print("== Arch Data Loaded!")
-        time.sleep(3)
+        # Discord must start even if the room is asleep or the endpoint lookup
+        # fails. The supervisor below retries; no stale dump is required to boot.
+        print("== Tracker startup attempted; waiting for connection data if unavailable.")
 
     DiscordThread = Process(target=Discord, args=(CoreConfig,ToggleConfig, item_queue, death_queue, chat_queue, seppuku_queue, discordseppuku_queue, websocket_queue, lottery_queue, discordbridge_queue, hint_queue, hintprocessing_queue))
     DiscordThread.start()
@@ -3011,13 +3025,15 @@ def main():
 
         if (CoreConfig["AdvancedConfig"]["DiscordJoinOnly"] == False):
             if not ToggleConfig["CrippleTracker"] and TrackerRetries.ready(time.monotonic()):
-                if not tracker_client.socket_thread.is_alive() or not websocket_queue.empty() or not seppuku_queue.empty():
+                if tracker_client.socket_thread is None or not tracker_client.socket_thread.is_alive() or not websocket_queue.empty() or not seppuku_queue.empty():
                     print("-- Tracker is not running, requested a restart, or has failed, so we do the needful")
 
                     tracker_client.has_connected = False
                     if TrackerRetries.failed(time.monotonic()):
-                        chat_queue.put({"type": "CORE", "data": {"text":
-                            "[CORE]: ERROR - Tracker could not reconnect after multiple attempts. Retrying automatically every 60 seconds."}, "flag": "ERROR"})
+                        print("!! Tracker reconnect attempts failed; retrying every 60 seconds.")
+                        if ConnectionUnavailableSince is None:
+                            ConnectionUnavailableSince = time.monotonic() - 60
+                        QueueRoomUnavailableNotice()
                     if not seppuku_queue.empty():
                         print("-- Tracker commited Seppuku, Requesting new port information")
                         print("-- Sleeping for 5 seconds to allow DiscordBot to process PortScan")

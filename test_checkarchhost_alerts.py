@@ -7,6 +7,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
+from modules.config_store import save_config_atomic
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -35,6 +37,7 @@ def load_set_config_variable():
         "ConfigLock": __import__("threading").RLock(),
         "ToggleLock": __import__("threading").RLock(),
         "ConfirmSpecialFiles": Mock(),
+        "save_config_atomic": save_config_atomic,
         "json": json,
     }
     exec(compile(ast.Module(body=[function], type_ignores=[]), "bridgeipelago.py", "exec"), namespace)
@@ -44,15 +47,11 @@ def load_set_config_variable():
 class SetConfigVariableTests(unittest.TestCase):
     def test_numeric_port_is_saved_as_number_and_returns_string(self):
         ns = load_set_config_variable()
-        real_open = open
         with tempfile.TemporaryDirectory() as temp_dir:
             config_path = Path(temp_dir) / "config.json"
 
-            def open_temp_config(path, mode="r", *args, **kwargs):
-                return real_open(config_path if path == "config.json" else path, mode, *args, **kwargs)
-
-            with patch("builtins.open", side_effect=open_temp_config):
-                result = ns["SetConfigVariable"]("ArchipelagoPort", 38282)
+            ns["config"] = config_path
+            result = ns["SetConfigVariable"]("ArchipelagoPort", 38282)
 
             self.assertEqual(result, "Key 'ArchipelagoPort' set to '38282'!")
             saved = json.loads(config_path.read_text(encoding="utf-8"))

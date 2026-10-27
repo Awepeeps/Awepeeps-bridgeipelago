@@ -85,6 +85,16 @@ class EndpointTests(unittest.TestCase):
         client.check_datapackage.assert_not_called()
         ns['WriteRoomInfo'].assert_not_called()
 
+    def test_failed_port_save_does_not_connect_or_announce_a_move(self):
+        cls, ns = load_tracker_client()
+        ns.update({'resolve_port': resolve_port, 'requests': SimpleNamespace(get=self.get),
+                   'connect': Mock(), 'SetConfigVariable': Mock(return_value=
+                       'Unable to save configuration. No settings were changed.')})
+        ns['CoreConfig']['ArchipelagoConfig'].update(self.config)
+        cls().start()
+        ns['connect'].assert_not_called()
+        self.assertEqual(ns['chat_queue'].messages, [])
+
     def test_matching_seed_allows_tracker_login(self):
         cls, ns = load_tracker_client()
         ns.update({'verify_seed': verify_seed, 'WriteRoomInfo': Mock()})

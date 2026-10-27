@@ -9,6 +9,7 @@ bot.py
 test/
 config.json
 config.json.bak*
+.bridgeipelago-config-*.tmp
 bot.out
 
 .idea/

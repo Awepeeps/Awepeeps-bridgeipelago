@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import discord
 
+from modules.config_store import save_config_atomic
 from modules.hint_relay import unused_corrupt_path
 from modules.player_commands import HINT_FIELD_MAX_LENGTH, HINT_NOT_REGISTERED_MESSAGE, register_player_commands
 
@@ -317,6 +318,7 @@ def load_set_config():
         "ConfigLock": threading.RLock(),
         "ToggleLock": threading.RLock(),
         "ConfirmSpecialFiles": Mock(),
+        "save_config_atomic": save_config_atomic,
         "json": json,
     }
     return load(["SetConfigVariable"], namespace)
@@ -324,13 +326,8 @@ def load_set_config():
 
 def run_set_config(ns, key, value, directory):
     config_path = Path(directory) / "config.json"
-    real_open = open
-
-    def open_temp_config(path, mode="r", *args, **kwargs):
-        return real_open(config_path if path == "config.json" else path, mode, *args, **kwargs)
-
-    with patch("builtins.open", side_effect=open_temp_config):
-        return ns["SetConfigVariable"](key, value)
+    ns["config"] = config_path
+    return ns["SetConfigVariable"](key, value)
 
 
 class SetConfigTests(unittest.TestCase):

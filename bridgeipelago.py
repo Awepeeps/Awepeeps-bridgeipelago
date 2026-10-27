@@ -66,6 +66,7 @@ from modules.hint_relay import (
     render_hint_message,
     unused_corrupt_path,
 )
+from modules.config_store import save_config_atomic
 from modules.room_endpoint import resolve_port, verify_seed
 from modules.report_completion import all_locations_checked, deathlink_games_finished
 from modules.tracker_recovery import TrackerRecovery
@@ -606,7 +607,9 @@ class TrackerClient():
             Port = resolve_port(CoreConfig["ArchipelagoConfig"],
                                 CoreConfig["AdvancedConfig"].get("SelfHostNoWeb", False), requests.get)
             if Port != int(CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]):
-                SetConfigVariable("ArchipelagoPort", Port)
+                UpdateStatus = SetConfigVariable("ArchipelagoPort", Port)
+                if UpdateStatus == "Unable to save configuration. No settings were changed.":
+                    raise OSError("Could not persist refreshed room port")
                 Host = CoreConfig["ArchipelagoConfig"]["ArchipelagoServer"].split("://")[-1]
                 chat_queue.put({"type": "CORE", "data": {"text":
                     "The Archipelago room moved to a new port. Reconnect to **" + Host + ":" + str(Port) + "**"}, "flag": "PORT_CHANGE"})
@@ -782,7 +785,9 @@ class HintClient:
             Port = resolve_port(CoreConfig["ArchipelagoConfig"],
                                 CoreConfig["AdvancedConfig"].get("SelfHostNoWeb", False), requests.get)
             if Port != int(CoreConfig["ArchipelagoConfig"]["ArchipelagoPort"]):
-                SetConfigVariable("ArchipelagoPort", Port)
+                UpdateStatus = SetConfigVariable("ArchipelagoPort", Port)
+                if UpdateStatus == "Unable to save configuration. No settings were changed.":
+                    raise OSError("Could not persist refreshed room port")
                 Host = CoreConfig["ArchipelagoConfig"]["ArchipelagoServer"].split("://")[-1]
                 chat_queue.put({"type": "CORE", "data": {"text":
                     "The Archipelago room moved to a new port. Reconnect to **" + Host + ":" + str(Port) + "**"}, "flag": "PORT_CHANGE"})
@@ -1372,7 +1377,9 @@ async def CheckArchHost():
                 #await MainChannel.send(message)
                 await DebugChannel.send(message)
                 # Local patch: tell players where the room moved.
-                SetConfigVariable("ArchipelagoPort", last_port)
+                UpdateStatus = SetConfigVariable("ArchipelagoPort", last_port)
+                if UpdateStatus == "Unable to save configuration. No settings were changed.":
+                    raise OSError("Could not persist refreshed room port")
                 RoomHost = CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'].split("/")[2]
                 if MainChannel is not None:
                     await MainChannel.send("The Archipelago room moved to a new port. Reconnect to **" + RoomHost + ":" + str(last_port) + "**")
@@ -2157,7 +2164,10 @@ async def Command_Hints(player):
     try:
         await player.create_dm()
 
-        page = requests.get(CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'])
+        page = await asyncio.to_thread(
+            requests.get, CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'], timeout=15,
+        )
+        page.raise_for_status()
         soup = BeautifulSoup(page.content, "html.parser")
 
         #Yoinks table rows from the checks table
@@ -2884,25 +2894,18 @@ def SetConfigVariable(key, value):
             if any(ord(char) < 32 or ord(char) == 127 for char in UniqueIDValue):
                 return "Invalid UniqueID. Use a plain value without path separators or control characters."
         with ConfigLock:
+            # Stage a detached snapshot; publish memory only after disk succeeds.
+            config_for_json = {k: dict(v) if hasattr(v, 'keys') else v for k, v in CoreConfig.items()}
+            config_for_json["ArchipelagoConfig"][key] = value
+            try:
+                save_config_atomic(config, config_for_json)
+            except (OSError, TypeError, ValueError):
+                # Do not echo exception text: it can contain config secrets.
+                return "Unable to save configuration. No settings were changed."
+            CoreConfig["ArchipelagoConfig"][key] = value
             if key == "ArchipelagoPort":
-                CoreConfig["ArchipelagoConfig"]['ArchipelagoPort'] = value
                 with ToggleLock:
                     ToggleConfig["CrippleTracker"] = False
-            if key == "ArchipelagoServerURL":
-                CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'] = value
-            elif key == "ArchipelagoPassword":
-                CoreConfig["ArchipelagoConfig"]['ArchipelagoPassword'] = value
-            elif key == "ArchipelagoTrackerURL":
-                CoreConfig["ArchipelagoConfig"]['ArchipelagoTrackerURL'] = value
-            elif key == "ArchipelagoServerURL":
-                CoreConfig["ArchipelagoConfig"]['ArchipelagoServerURL'] = value
-            elif key == "UniqueID":
-                CoreConfig["ArchipelagoConfig"]['UniqueID'] = value
-            
-            # Convert shared dict to regular dict for JSON serialization
-            config_for_json = {k: dict(v) if hasattr(v, 'keys') else v for k, v in CoreConfig.items()}
-            with open('config.json', "w") as config_file:
-                json.dump(config_for_json, config_file, indent=4)
 
         #We'll reconfirm and reload the data locations since we can change values.
         ConfirmSpecialFiles()
@@ -2977,7 +2980,9 @@ def main():
     # Version Checking against GitHub
     try:
         BPversion = "live-v3.0.1"
-        GHAPIjson = json.loads(requests.get("https://api.github.com/repos/Quasky/bridgeipelago/releases/latest").content)
+        response = requests.get("https://api.github.com/repos/Quasky/bridgeipelago/releases/latest", timeout=15)
+        response.raise_for_status()
+        GHAPIjson = json.loads(response.content)
         if(GHAPIjson["tag_name"] != BPversion):
             print("You are not running the current release of Bridgeipelago.")
             print("The current version is: " + GHAPIjson["tag_name"] + " -- You are running: " + BPversion)
